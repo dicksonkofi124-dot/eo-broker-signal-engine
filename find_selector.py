@@ -20,6 +20,9 @@ load_dotenv()
 PROFILE = os.getenv("USER_DATA_DIR", "./eo_profile")
 LO = float(os.getenv("PRICE_MIN", "0.9") or 0.9)
 HI = float(os.getenv("PRICE_MAX", "1.4") or 1.4)
+CHANNEL = os.getenv("BROWSER_CHANNEL", "").strip()
+BPATH = os.getenv("BROWSER_PATH", "").strip()
+BARGS = os.getenv("BROWSER_ARGS", "").split()
 
 JS = """
 ([lo, hi]) => {
@@ -71,9 +74,14 @@ async def read_all(page):
 
 async def main() -> None:
     async with async_playwright() as p:
-        ctx = await p.chromium.launch_persistent_context(
-            PROFILE, headless=False, viewport={"width": 1400, "height": 900}
-        )
+        kw = {"headless": False, "viewport": {"width": 1400, "height": 900}, "timeout": 60_000}
+        if BARGS:
+            kw["args"] = BARGS
+        if BPATH:
+            kw["executable_path"] = BPATH
+        elif CHANNEL:
+            kw["channel"] = CHANNEL
+        ctx = await p.chromium.launch_persistent_context(PROFILE, **kw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await page.goto("https://expertoption.com", timeout=90_000)
         await asyncio.to_thread(

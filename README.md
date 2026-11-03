@@ -26,15 +26,8 @@ Telegram**. You place any real trades yourself. The bot never clicks or trades.
 
 ## Step 1: Get the project onto your PC
 
-Clone this repository and open its folder:
-
-```bash
-git clone https://github.com/dicksonkofi124-dot/eo-broker-signal-engine.git
-cd eo-broker-signal-engine
-```
-
-You should see `broker.py`, `find_selector.py`, `requirements.txt`, and
-`.env.example`.
+Unzip `eo_broker_bot_v2.zip` to a folder, for example `C:\eo_broker_bot`.
+You should see `broker.py`, `find_selector.py`, `requirements.txt`, `.env.example`.
 
 ## Step 2: Install
 
@@ -101,6 +94,17 @@ create table learning_samples (
 );
 ```
 
+If the bot later logs `permission denied for table ...` (code 42501), run this
+too in the SQL Editor (newer Supabase projects don't grant API access to new tables by default):
+
+```sql
+grant usage on schema public to service_role;
+grant all on all tables in schema public to service_role;
+grant all on all sequences in schema public to service_role;
+alter default privileges in schema public grant all on tables to service_role;
+alter default privileges in schema public grant all on sequences to service_role;
+```
+
 ## Step 5: Fill in `.env`
 
 1. Copy `.env.example` to a new file named `.env` (same folder).
@@ -138,6 +142,27 @@ python find_selector.py
 
 If it prints "None changed", the chart wasn't open or the market was closed
 (forex pauses on weekends). Try again when EUR/USD is moving.
+
+## Step 6b: Price source (recommended, replaces the selector)
+
+Expert Option draws its chart on a canvas, so there is no text to scrape. The
+bot instead reads the live EUR/USD ticks the page already receives over its own
+websocket (read-only; other traders' messages are ignored).
+
+In `.env`:
+
+```
+PRICE_SOURCE=ws
+ASSET_ID=142
+```
+
+`142` is the EUR/USD id seen on one account/session. To confirm it: run the bot,
+open the EUR/USD chart, and compare the log line `First price received: ...`
+with the price on your chart. If they don't match, leave `ASSET_ID` empty;
+the bot then logs candidate ids with prices in your `PRICE_MIN`/`PRICE_MAX`
+range. Pick the one that matches your chart. Keep the EUR/USD chart open while
+the bot runs. If EO changes its data format, the bot goes quiet ("Price stale")
+and `ws_probe.py` / `ws_probe_candles.py` can be rerun to find the new layout.
 
 ## Step 7: Run the bot
 
@@ -185,7 +210,9 @@ money at an 85% payout. Under that, the signals lose money in the long run.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `PRICE_SELECTOR` | empty | Exact price element from `find_selector.py` |
+| `PRICE_SOURCE` | ws | `ws` = read live ticks from the page's websocket; `dom` = old text scraping |
+| `ASSET_ID` | none | EUR/USD id in the feed (see Step 6b) |
+| `PRICE_SELECTOR` | empty | Only for `PRICE_SOURCE=dom` |
 | `PRICE_MIN` / `PRICE_MAX` | 0.9 / 1.4 | Ignore any number outside this range (EUR/USD) |
 | `SIGNAL_GATE` | relaxed | `off`, `relaxed` (blocks only if provably below 50%), `strict` (signals only after proven edge) |
 | `EDGE_MODE` | adaptive | `adaptive` uses top-percent thresholds, `fixed` uses fixed ones |
@@ -214,8 +241,13 @@ money at an 85% payout. Under that, the signals lose money in the long run.
 | "Waiting for you to log in..." keeps showing | Log in and open the trading screen. It never restarts while waiting. |
 | "Price stale" warnings | The chart stopped (market closed or page frozen). It reloads, then relaunches automatically. |
 | No Telegram messages | Press Start on your bot, check the token and chat id. |
-| Supabase errors | Check the URL and key, and that all four tables exist. |
+| `permission denied for table` (42501) | Run the GRANT SQL in Step 4, and make sure `SUPABASE_KEY` is the service_role/secret key. |
+| `Price stale` again and again | Keep the browser window visible and the Mac awake: run `caffeinate -dims python broker.py`. Check your connection (Telegram timeouts mean it is flaky). |
+| `APIError` / `Supabase table ... NOT usable` | Use the **service_role** key (not anon) and run the SQL from Step 4. The bot checks this at startup and says which table failed. |
+| `find_selector.py` finds nothing | Make sure the live price is visible on screen first. Forex is **closed on weekends** (Fri evening to Sun ~22:00 UTC), so EUR/USD won't move; try again when it is open. Paste the output if it still finds nothing. |
 | PC went to sleep, bot silent | Turn off sleep in power settings, then restart the bot. |
+| Browser hangs or crashes on launch | Install Google Chrome (google.com/chrome), then in `.env` set `BROWSER_CHANNEL=chrome` and `USER_DATA_DIR=./eo_profile_chrome`. Quit all Chrome windows first. If it still hangs: `pkill -f eo_profile`, delete the profile folder, retry. |
+| GPU / EGL errors, browser hangs | Add `BROWSER_ARGS=--disable-gpu` to `.env` (software rendering; the chart still works). |
 | `playwright install` fails | Re-run it with the `venv` active. |
 
 ---

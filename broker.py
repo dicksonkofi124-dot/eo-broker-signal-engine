@@ -12,6 +12,7 @@ Service. Personal paper-trading research only, at your own risk.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -34,6 +35,11 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 USER_DATA_DIR = os.getenv("USER_DATA_DIR", "./eo_profile")
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "").strip()  # "chrome" = use installed Google Chrome
+BROWSER_PATH = os.getenv("BROWSER_PATH", "").strip()        # or full path to a browser executable
+BROWSER_ARGS = os.getenv("BROWSER_ARGS", "").split()          # e.g. --disable-gpu
+PRICE_SOURCE = os.getenv("PRICE_SOURCE", "ws").strip().lower()  # ws = page's websocket ticks, dom = page text
+ASSET_ID = int(os.getenv("ASSET_ID", "0") or 0)                  # EUR/USD asset id in the websocket feed
 PRICE_SELECTOR = os.getenv("PRICE_SELECTOR", "").strip()  # exact CSS selector (from find_selector.py)
 PRICE_MIN = float(os.getenv("PRICE_MIN", "0") or 0)       # sanity range, e.g. 0.9 for EUR/USD
 PRICE_MAX = float(os.getenv("PRICE_MAX", "0") or 0)             # e.g. 1.4 ; 0 = no range check
@@ -200,6 +206,9 @@ class PlaywrightScraperFeed:
         self.last_update_at: Optional[datetime] = None
         self._last_sample_ts: Optional[float] = None
         self._pending_jump: list[float] = []
+        self._candidates: dict = {}
+        self._last_frame_at: Optional[float] = None
+        self._cand_logged_at = 0.0
 
         self.is_running = True
         self._restart_count = 0
@@ -226,7 +235,7 @@ class PlaywrightScraperFeed:
         logger.info("Starting Playwright scraper (headful, persistent profile)...")
         await self._launch_browser()
         self._tasks = [
-            asyncio.create_task(self._extraction_loop(), name="extract"),
+            *([asyncio.create_task(self._extraction_loop(), name="extract")] if PRICE_SOURCE == "dom" else []),
             asyncio.create_task(self._sampler_loop(), name="sampler"),
             asyncio.create_task(self._health_monitor(), name="health"),
         ]
@@ -241,14 +250,62 @@ class PlaywrightScraperFeed:
             self.playwright = await async_playwright().start()
 
         # Persistent profile => login cookies survive relaunches.
-        self.context = await self.playwright.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=False,
-            viewport={"width": 1400, "height": 900},
-        )
+        kwargs: dict = {"headless": False, "viewport": {"width": 1400, "height": 900}, "timeout": 60_000}
+        if BROWSER_ARGS:
+            kwargs["args"] = BROWSER_ARGS
+        if BROWSER_PATH:
+            kwargs["executable_path"] = BROWSER_PATH
+        elif BROWSER_CHANNEL:
+            kwargs["channel"] = BROWSER_CHANNEL
+        self.context = await self.playwright.chromium.launch_persistent_context(USER_DATA_DIR, **kwargs)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-        logger.info("Browser ready. Log in manually if needed, then open the trading screen.")
+        if PRICE_SOURCE == "ws":
+            self.page.on("websocket", self._on_ws)
+            self.context.on("page", lambda pg: pg.on("websocket", self._on_ws))
+        logger.info("Browser ready. Log in manually if needed, then open the EUR/USD chart.")
         await self.page.goto("https://expertoption.com", timeout=90_000)
+
+    # ---- websocket price source (read-only: only incoming market ticks are used) ----
+    def _on_ws(self, ws) -> None:
+        ws.on("framereceived", self._on_frame)
+
+    def _on_frame(self, payload) -> None:
+        self._last_frame_at = datetime.now(timezone.utc).timestamp()
+        try:
+            if isinstance(payload, (bytes, bytearray)):
+                payload = bytes(payload).decode("utf-8")
+            if '"candles"' not in payload:  # ignore everything except market candles
+                return
+            obj = json.loads(payload)
+            if obj.get("action") != "candles":
+                return
+            msg = obj.get("message")
+            if not isinstance(msg, dict):
+                return
+            aid = msg.get("assetId")
+            ticks: list[float] = []
+            for c in msg.get("candles") or []:
+                v = c.get("v")
+                if c.get("tf") == 0 and isinstance(v, list) and v and isinstance(v[0], (int, float)):
+                    ticks.append(float(v[0]))  # tf=0 is a live tick: v = [price]
+            if not ticks:
+                return
+            if ASSET_ID == 0:
+                if PRICE_MAX > 0 and PRICE_MIN <= ticks[-1] <= PRICE_MAX:
+                    self._candidates[aid] = ticks[-1]
+                now = datetime.now(timezone.utc).timestamp()
+                if self._candidates and now - self._cand_logged_at > 20:
+                    self._cand_logged_at = now
+                    logger.warning("ASSET_ID is not set. Assets with prices in range: %s. "
+                                   "Pick the one matching your EUR/USD chart and put ASSET_ID=<id> in .env.",
+                                   self._candidates)
+                return
+            if aid != ASSET_ID:
+                return
+            for tick in ticks:
+                self._accept_price(tick)
+        except Exception as exc:
+            logger.debug("ws frame ignored: %s", exc)
 
     async def _extraction_loop(self) -> None:
         while self.is_running:
@@ -288,6 +345,8 @@ class PlaywrightScraperFeed:
             self.price_buffer.clear()
             self.history.clear()
         self._pending_jump.clear()
+        if not self._ever_had_price:
+            logger.info("First price received: %.5f (compare with your chart)", val)
         self.latest_price = val
         self.last_update_at = datetime.now(timezone.utc)
         self._ever_had_price = True
@@ -323,7 +382,13 @@ class PlaywrightScraperFeed:
             if age <= PRICE_STALE_SECONDS:
                 continue
 
-            logger.warning("Price stale for %.0fs.", age)
+            frame_age = (now.timestamp() - self._last_frame_at) if self._last_frame_at else 1e9
+            if PRICE_SOURCE == "ws" and frame_age < 15:
+                logger.warning(
+                    "No EUR/USD ticks for %.0fs, but the site's data IS flowing. Is the EUR/USD chart open "
+                    "and the browser window visible (not minimised/hidden)? Not reloading.", age)
+                continue
+            logger.warning("Price stale for %.0fs (last site data %.0fs ago).", age, min(frame_age, 9999))
             try:
                 if self.page is None or self.page.is_closed() or self._reload_count >= MAX_RELOADS_BEFORE_RELAUNCH:
                     if self._restart_count >= MAX_BROWSER_RESTARTS:
@@ -842,7 +907,7 @@ class EOLivePredictorBot:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
         while self.is_running:
             try:
-                async with httpx.AsyncClient(timeout=25) as client:
+                async with httpx.AsyncClient(timeout=45) as client:
                     response = await client.get(url, params={"offset": offset, "timeout": 20})
                     data = response.json()
                     for update in (data.get("result") or []) if data.get("ok") else []:
