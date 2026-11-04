@@ -38,8 +38,17 @@ USER_DATA_DIR = os.getenv("USER_DATA_DIR", "./eo_profile")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "").strip()  # "chrome" = use installed Google Chrome
 BROWSER_PATH = os.getenv("BROWSER_PATH", "").strip()        # or full path to a browser executable
 BROWSER_ARGS = os.getenv("BROWSER_ARGS", "").split()          # e.g. --disable-gpu
+def _viewport() -> dict:
+    m = re.match(r"^(\d+)x(\d+)$", os.getenv("BROWSER_VIEWPORT", "1180x560").strip())
+    return {"width": int(m.group(1)), "height": int(m.group(2))} if m else {"width": 1180, "height": 560}
+
+
 PRICE_SOURCE = os.getenv("PRICE_SOURCE", "ws").strip().lower()  # ws = page's websocket ticks, dom = page text
-ASSET_ID = int(os.getenv("ASSET_ID", "0") or 0)                  # EUR/USD asset id in the websocket feed
+SIGNAL_TEST_MODE = os.getenv("SIGNAL_TEST_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+TEST_INTERVAL_SECONDS = max(30, int(os.getenv("TEST_INTERVAL_SECONDS", "120") or 120))
+_ASSET_RAW = os.getenv("ASSET_ID", "").strip()
+ASSET_AUTO = _ASSET_RAW.lower() == "auto"       # pick the single asset ticking in the price range
+ASSET_ID = int(_ASSET_RAW) if _ASSET_RAW.isdigit() else 0                  # EUR/USD asset id in the websocket feed
 PRICE_SELECTOR = os.getenv("PRICE_SELECTOR", "").strip()  # exact CSS selector (from find_selector.py)
 PRICE_MIN = float(os.getenv("PRICE_MIN", "0") or 0)       # sanity range, e.g. 0.9 for EUR/USD
 PRICE_MAX = float(os.getenv("PRICE_MAX", "0") or 0)             # e.g. 1.4 ; 0 = no range check
@@ -134,6 +143,31 @@ def _safe_err(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def format_signal(direction: str, price: float, score: float, expiry: int,
+                  confidence: Optional[str] = None, gate: Optional[str] = None,
+                  test: bool = False) -> str:
+    """Telegram message: green block for BUY, red block for SELL (Telegram cannot colour text)."""
+    buy = direction == "BUY"
+    dot = "🟢" if buy else "🔴"
+    arrow = "▲" if buy else "▼"
+    bar = dot * 8
+    lines = []
+    if test:
+        lines += ["🧪 <b>TEST ONLY, DO NOT TRADE</b>", ""]
+    lines += [bar, f"<b>{direction} {arrow}  EUR/USD</b>", bar, ""]
+    lines += [f"💰 Price: <code>{price:.5f}</code>", f"⏱ Expiry: {expiry}s"]
+    if confidence:
+        lines.append(f"🎯 Confidence: {confidence}")
+    lines.append(f"📊 Score: <code>{score:+.4f}</code>")
+    lines.append(f"🕒 Time: {datetime.now().strftime('%H:%M:%S')}")
+    if gate:
+        lines.append(f"🚦 Gate: {gate}")
+    lines.append("")
+    lines.append("<i>Pipeline check only: the model has shown no edge.</i>" if test
+                 else "<i>Paper signal, not financial advice.</i>")
+    return "\n".join(lines)
+
+
 async def broadcast_telegram(
     message: str, db_client: Client, subscribers: set[str] | None = None
 ) -> None:
@@ -208,6 +242,9 @@ class PlaywrightScraperFeed:
         self._pending_jump: list[float] = []
         self._candidates: dict = {}
         self._last_frame_at: Optional[float] = None
+        self._frames_seen = 0
+        self._auto_id = None
+        self._seen_ticks: dict = {}
         self._cand_logged_at = 0.0
 
         self.is_running = True
@@ -250,9 +287,8 @@ class PlaywrightScraperFeed:
             self.playwright = await async_playwright().start()
 
         # Persistent profile => login cookies survive relaunches.
-        kwargs: dict = {"headless": False, "viewport": {"width": 1400, "height": 900}, "timeout": 60_000}
-        if BROWSER_ARGS:
-            kwargs["args"] = BROWSER_ARGS
+        kwargs: dict = {"headless": False, "viewport": _viewport(), "timeout": 60_000}
+        kwargs["args"] = ["--window-position=0,0"] + BROWSER_ARGS  # keep the window on screen
         if BROWSER_PATH:
             kwargs["executable_path"] = BROWSER_PATH
         elif BROWSER_CHANNEL:
@@ -271,6 +307,7 @@ class PlaywrightScraperFeed:
 
     def _on_frame(self, payload) -> None:
         self._last_frame_at = datetime.now(timezone.utc).timestamp()
+        self._frames_seen += 1
         try:
             if isinstance(payload, (bytes, bytearray)):
                 payload = bytes(payload).decode("utf-8")
@@ -290,17 +327,26 @@ class PlaywrightScraperFeed:
                     ticks.append(float(v[0]))  # tf=0 is a live tick: v = [price]
             if not ticks:
                 return
-            if ASSET_ID == 0:
+            if (PRICE_MAX <= 0 or PRICE_MIN <= ticks[-1] <= PRICE_MAX) and len(self._seen_ticks) < 20:
+                self._seen_ticks[aid] = ticks[-1]
+            target = ASSET_ID or self._auto_id
+            if target is None:
                 if PRICE_MAX > 0 and PRICE_MIN <= ticks[-1] <= PRICE_MAX:
                     self._candidates[aid] = ticks[-1]
-                now = datetime.now(timezone.utc).timestamp()
-                if self._candidates and now - self._cand_logged_at > 20:
-                    self._cand_logged_at = now
-                    logger.warning("ASSET_ID is not set. Assets with prices in range: %s. "
-                                   "Pick the one matching your EUR/USD chart and put ASSET_ID=<id> in .env.",
-                                   self._candidates)
-                return
-            if aid != ASSET_ID:
+                if ASSET_AUTO and len(self._candidates) == 1:
+                    self._auto_id = next(iter(self._candidates))
+                    logger.info("ASSET_ID=auto: using asset id %s (the only asset ticking in your price range). "
+                                "Check that its price matches your EUR/USD chart.", self._auto_id)
+                    target = self._auto_id
+                else:
+                    now = datetime.now(timezone.utc).timestamp()
+                    if self._candidates and now - self._cand_logged_at > 20:
+                        self._cand_logged_at = now
+                        logger.warning("ASSET_ID is not set. Assets with prices in range: %s. "
+                                       "Put ASSET_ID=<id> (or auto) in .env.", self._candidates)
+                    if target is None:
+                        return
+            if aid != target:
                 return
             for tick in ticks:
                 self._accept_price(tick)
@@ -374,7 +420,18 @@ class PlaywrightScraperFeed:
             if not self._ever_had_price:
                 # Still waiting for the user to log in – never restart here.
                 if (now - self._waiting_logged_at).total_seconds() >= 60:
-                    logger.info("Waiting for you to log in and open the trading screen...")
+                    fa = (now.timestamp() - self._last_frame_at) if self._last_frame_at else None
+                    logger.info(
+                        "Waiting for EUR/USD ticks. Site data frames received: %s (last %s). "
+                        "Assets ticking in range: %s. ASSET_ID=%s",
+                        self._frames_seen, "never" if fa is None else f"{fa:.0f}s ago",
+                        self._seen_ticks or "none", ASSET_ID or "unset")
+                    if self._frames_seen == 0:
+                        logger.info("-> No data from the site at all: is the page loaded and logged in?")
+                    elif ASSET_ID and self._seen_ticks and ASSET_ID not in self._seen_ticks:
+                        logger.warning("-> Ticks exist for other asset ids (see list above). Set ASSET_ID=auto, or the id matching your chart.")
+                    elif not self._seen_ticks:
+                        logger.info("-> Site is connected but no EUR/USD ticks yet: open the EUR/USD chart.")
                     self._waiting_logged_at = now
                 continue
 
@@ -784,6 +841,7 @@ class EOLivePredictorBot:
         self.trading_unlocked = False
         self.unlock_time = datetime.now() + timedelta(seconds=OBSERVATION_SECONDS)
         self.last_signal_time = datetime.now() - timedelta(seconds=60)
+        self.last_test_time = datetime.now() - timedelta(seconds=TEST_INTERVAL_SECONDS)
         self.last_model_save = datetime.now(timezone.utc)
 
         self.db_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -939,10 +997,11 @@ class EOLivePredictorBot:
                 await asyncio.sleep(5)
             await asyncio.sleep(2)
 
-    async def log_trade(self, direction: str, price: float, score: float) -> bool:
+    async def log_trade(self, direction: str, price: float, score: float,
+                        asset_pair: str = "EO Broker Live Chart") -> bool:
         try:
             await db(lambda: self.db_client.table("paper_trades").insert({
-                "asset_pair": "EO Broker Live Chart",
+                "asset_pair": asset_pair,
                 "direction": direction,
                 "entry_price": round(price, 5),
                 "pytorch_output": round(score, 4),
@@ -964,22 +1023,23 @@ class EOLivePredictorBot:
                     price = prices[-1]
                     since_last = (datetime.now() - self.last_signal_time).total_seconds()
 
+                    if SIGNAL_TEST_MODE and score != 0 and \
+                            (datetime.now() - self.last_test_time).total_seconds() >= TEST_INTERVAL_SECONDS:
+                        self.last_test_time = datetime.now()
+                        direction = "BUY" if score > 0 else "SELL"
+                        if await self.log_trade(direction, price, score, asset_pair="EO Broker TEST"):
+                            await broadcast_telegram(
+                                format_signal(direction, price, score, TRADE_EXPIRATION_SECONDS, test=True),
+                                self.db_client, self.subscribers)
+
                     if decision != 0 and confidence != "Low" and since_last >= SIGNAL_COOLDOWN_SECONDS:
                         direction = "BUY" if decision == 1 else "SELL"
                         self.last_signal_time = datetime.now()  # set first: no double-fire on DB retry
                         if not await self.log_trade(direction, price, score):
                             await asyncio.sleep(1)
                             continue
-                        emoji = "🟢" if decision == 1 else "🔴"
-                        msg = (
-                            f"{emoji} <b>{direction} PATTERN ALERT (paper)</b>\n\n"
-                            f"Asset Price: <code>{price:.5f}</code>\n"
-                            f"Pattern Score: <code>{score:.4f}</code>\n"
-                            f"Horizon Expiry: {expiration}s\n"
-                            f"Confidence: {confidence}\n"
-                            f"Gate: {self.jarvis.gate_status()}\n\n"
-                            f"Timestamp: {datetime.now().strftime('%H:%M:%S')}"
-                        )
+                        msg = format_signal(direction, price, score, expiration,
+                                            confidence=confidence, gate=self.jarvis.gate_status())
                         await broadcast_telegram(msg, self.db_client, self.subscribers)
             except Exception as exc:
                 logger.error("Execution loop error: %s", exc)

@@ -153,10 +153,10 @@ In `.env`:
 
 ```
 PRICE_SOURCE=ws
-ASSET_ID=142
+ASSET_ID=auto
 ```
 
-`142` is the EUR/USD id seen on one account/session. To confirm it: run the bot,
+`142` was the EUR/USD id in one session and `245` in another, so ids can change. Use `ASSET_ID=auto` (the bot then uses the one asset ticking inside your `PRICE_MIN`/`PRICE_MAX` range). To confirm it: run the bot,
 open the EUR/USD chart, and compare the log line `First price received: ...`
 with the price on your chart. If they don't match, leave `ASSET_ID` empty;
 the bot then logs candidate ids with prices in your `PRICE_MIN`/`PRICE_MAX`

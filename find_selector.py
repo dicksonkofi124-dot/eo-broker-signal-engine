@@ -74,9 +74,8 @@ async def read_all(page):
 
 async def main() -> None:
     async with async_playwright() as p:
-        kw = {"headless": False, "viewport": {"width": 1400, "height": 900}, "timeout": 60_000}
-        if BARGS:
-            kw["args"] = BARGS
+        kw = {"headless": False, "viewport": {"width": 1180, "height": 560}, "timeout": 60_000}
+        kw["args"] = ["--window-position=0,0"] + BARGS
         if BPATH:
             kw["executable_path"] = BPATH
         elif CHANNEL:
