@@ -1,4 +1,7 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/venv/bin/python",
-  "python.terminal.activateEnvironment": true
+  "python.terminal.activateEnvironment": true,
+  "terminal.integrated.env.osx": {
+    "PATH": "/usr/local/bin:${env:PATH}"
+  }
 }

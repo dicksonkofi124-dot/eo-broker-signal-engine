@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from ensemble_models import DualModelEnsemble, EnsemblePrediction
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -832,6 +833,8 @@ class EOLivePredictorBot:
         self.feed = PlaywrightScraperFeed()
         self.jarvis = JarvisLearningModule()
         self.trackers = [HorizonTracker(*h) for h in HORIZONS]
+        self.ensemble = DualModelEnsemble()
+        self._ensemble_samples: list[dict] = []
         self.trackers[0].model = self.jarvis.model
         self.trackers[0].on_result = self.jarvis.record_shadow
 
@@ -846,6 +849,48 @@ class EOLivePredictorBot:
 
         self.db_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         logger.info("Connected to Supabase.")
+
+    def load_samples_for_ensemble(self, limit: int = 5000) -> list[dict]:
+        """Pull recent learning_samples from Supabase for ensemble training."""
+        try:
+            resp = (
+                self.db_client.table("learning_samples")
+                .select("features, label, horizon_seconds, predicted_edge")
+                .order("id", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            rows = resp.data or []
+            samples = []
+            for r in rows:
+                feats = r.get("features")
+                label = r.get("label")
+                if feats is None or label is None:
+                    continue
+                if isinstance(feats, str):
+                    feats = json.loads(feats)
+                if len(feats) != 9:
+                    continue
+                samples.append({
+                    "features": [float(x) for x in feats],
+                    "label": int(label),
+                    "horizon_seconds": r.get("horizon_seconds"),
+                })
+            return samples
+        except Exception as exc:
+            logger.error("Failed to load samples for ensemble: %s", exc)
+            return []
+
+    async def maybe_retrain_ensemble(self) -> None:
+        """Retrain LightGBM + Neural Net if enough new data exists."""
+        samples = self.load_samples_for_ensemble(limit=8000)
+        if len(samples) < 400:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            await loop.run_in_executor(pool, self.ensemble.maybe_retrain, samples)
 
     def check_database(self) -> None:
         """Fail loudly and clearly if Supabase is mis-set-up (wrong key / missing tables)."""
@@ -1019,7 +1064,17 @@ class EOLivePredictorBot:
             try:
                 if self.trading_unlocked and self.feed.has_fresh_price() and self.feed.has_full_price_window():
                     prices = self.feed.get_latest_prices(SEQUENCE_LENGTH)
-                    decision, score, expiration, confidence = self.jarvis.evaluate_sequence(prices)
+                    features = self.jarvis.extract_features(prices)
+                    if self.ensemble.is_ready and features is not None:
+                        pred = self.ensemble.predict(features)
+                        decision = pred.direction
+                        score = pred.edge
+                        confidence = pred.confidence
+                        if confidence not in ("Medium", "High") or not self.jarvis.gate_allows():
+                            decision = 0
+                        expiration = TRADE_EXPIRATION_SECONDS
+                    else:
+                        decision, score, expiration, confidence = self.jarvis.evaluate_sequence(prices)
                     price = prices[-1]
                     since_last = (datetime.now() - self.last_signal_time).total_seconds()
 
@@ -1135,6 +1190,7 @@ class EOLivePredictorBot:
                 if (now - self.last_model_save).total_seconds() >= MODEL_SAVE_SECONDS:
                     snapshot = self.model_state_snapshot()
                     await db(lambda: self.save_model_state(snapshot))
+                    await self.maybe_retrain_ensemble()
                     self.last_model_save = now
                     for t in self.trackers:
                         logger.info(t.summary())
