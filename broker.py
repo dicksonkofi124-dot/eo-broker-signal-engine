@@ -20,14 +20,16 @@ import re
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from ensemble_models import DualModelEnsemble, EnsemblePrediction
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from playwright.async_api import async_playwright, BrowserContext, Page, Playwright
 from supabase import create_client, Client
+
+if TYPE_CHECKING:
+    from ensemble_models import DualModelEnsemble
 
 load_dotenv()
 
@@ -39,6 +41,10 @@ USER_DATA_DIR = os.getenv("USER_DATA_DIR", "./eo_profile")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "").strip()  # "chrome" = use installed Google Chrome
 BROWSER_PATH = os.getenv("BROWSER_PATH", "").strip()        # or full path to a browser executable
 BROWSER_ARGS = os.getenv("BROWSER_ARGS", "").split()          # e.g. --disable-gpu
+BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "").strip().lower() in ("1", "true", "yes", "on")
+ENSEMBLE_ENABLED = os.getenv("ENSEMBLE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _viewport() -> dict:
     m = re.match(r"^(\d+)x(\d+)$", os.getenv("BROWSER_VIEWPORT", "1180x560").strip())
     return {"width": int(m.group(1)), "height": int(m.group(2))} if m else {"width": 1180, "height": 560}
@@ -288,7 +294,7 @@ class PlaywrightScraperFeed:
             self.playwright = await async_playwright().start()
 
         # Persistent profile => login cookies survive relaunches.
-        kwargs: dict = {"headless": False, "viewport": _viewport(), "timeout": 60_000}
+        kwargs: dict = {"headless": BROWSER_HEADLESS, "viewport": _viewport(), "timeout": 60_000}
         kwargs["args"] = ["--window-position=0,0"] + BROWSER_ARGS  # keep the window on screen
         if BROWSER_PATH:
             kwargs["executable_path"] = BROWSER_PATH
@@ -833,7 +839,11 @@ class EOLivePredictorBot:
         self.feed = PlaywrightScraperFeed()
         self.jarvis = JarvisLearningModule()
         self.trackers = [HorizonTracker(*h) for h in HORIZONS]
-        self.ensemble = DualModelEnsemble()
+        self.ensemble: Optional[DualModelEnsemble] = None
+        if ENSEMBLE_ENABLED:
+            from ensemble_models import DualModelEnsemble
+
+            self.ensemble = DualModelEnsemble()
         self._ensemble_samples: list[dict] = []
         self.trackers[0].model = self.jarvis.model
         self.trackers[0].on_result = self.jarvis.record_shadow
@@ -883,6 +893,8 @@ class EOLivePredictorBot:
 
     async def maybe_retrain_ensemble(self) -> None:
         """Retrain LightGBM + Neural Net if enough new data exists."""
+        if self.ensemble is None:
+            return
         samples = self.load_samples_for_ensemble(limit=8000)
         if len(samples) < 400:
             return
@@ -1065,7 +1077,7 @@ class EOLivePredictorBot:
                 if self.trading_unlocked and self.feed.has_fresh_price() and self.feed.has_full_price_window():
                     prices = self.feed.get_latest_prices(SEQUENCE_LENGTH)
                     features = self.jarvis.extract_features(prices)
-                    if self.ensemble.is_ready and features is not None:
+                    if self.ensemble is not None and self.ensemble.is_ready and features is not None:
                         pred = self.ensemble.predict(features)
                         decision = pred.direction
                         score = pred.edge

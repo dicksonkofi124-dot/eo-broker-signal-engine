@@ -219,8 +219,15 @@ money at an 85% payout. Under that, the signals lose money in the long run.
 | `SIGNAL_TOP_PERCENT` | 3 | Lower = fewer, more selective signals |
 | `PAYOUT` | 0.85 | Your broker payout, used to show the breakeven rate |
 | `USER_DATA_DIR` | ./eo_profile | Saved browser profile (keeps your login) |
+| `BROWSER_HEADLESS` | false | Run Chromium without a visible window; use only after logging in and saving the browser profile |
+| `ENSEMBLE_ENABLED` | true | Train/use the LightGBM + neural-network ensemble; disable on low-memory machines |
 
 `strict` is the safest choice: it stays silent until the model has shown a real edge.
+
+The ensemble additionally requires NumPy, scikit-learn, and LightGBM. On a
+low-memory machine, set `ENSEMBLE_ENABLED=false` to use the online logistic
+model without loading those packages. Headless mode cannot be used to manually
+log in; first create an authenticated browser profile, then enable it.
 
 ---
 

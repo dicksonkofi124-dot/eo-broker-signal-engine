@@ -17,8 +17,6 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
-
 logger = logging.getLogger("EO_Scraping_Engine")
 
 # Optional heavy deps – imported lazily
@@ -111,6 +109,8 @@ class DualModelEnsemble:
             return False
 
     def _train(self, samples: list[dict]) -> None:
+        import numpy as np
+
         _ensure_deps()
 
         X = np.array([s["features"] for s in samples], dtype=np.float64)
@@ -167,6 +167,8 @@ class DualModelEnsemble:
             raise RuntimeError("Both models failed to train")
 
     def predict(self, features: list[float]) -> EnsemblePrediction:
+        import numpy as np
+
         if not self.is_ready:
             return EnsemblePrediction(proba=0.5, edge=0.0, direction=0, detail="not ready")
 
