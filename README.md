@@ -228,6 +228,8 @@ The ensemble additionally requires NumPy, scikit-learn, and LightGBM. On a
 low-memory machine, set `ENSEMBLE_ENABLED=false` to use the online logistic
 model without loading those packages. Headless mode cannot be used to manually
 log in; first create an authenticated browser profile, then enable it.
+On a 1 GB VM, enabling ensemble training may cause slowdowns or process restarts;
+swap can reduce abrupt out-of-memory failures but will make training slower.
 
 ---
 
