@@ -873,6 +873,8 @@ class EOLivePredictorBot:
             rows = resp.data or []
             samples = []
             for r in rows:
+                if r.get("horizon_seconds") != TRADE_EXPIRATION_SECONDS:
+                    continue
                 feats = r.get("features")
                 label = r.get("label")
                 if feats is None or label is None:
