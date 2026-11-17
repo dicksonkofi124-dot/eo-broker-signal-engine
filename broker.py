@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -844,6 +845,9 @@ class EOLivePredictorBot:
             from ensemble_models import DualModelEnsemble
 
             self.ensemble = DualModelEnsemble()
+        self.ensemble_sample_count = 0
+        self.last_ai_output: Optional[dict] = None
+        self.last_ai_status_log_at = 0.0
         self._ensemble_samples: list[dict] = []
         self.trackers[0].model = self.jarvis.model
         self.trackers[0].on_result = self.jarvis.record_shadow
@@ -898,13 +902,23 @@ class EOLivePredictorBot:
         if self.ensemble is None:
             return
         samples = self.load_samples_for_ensemble(limit=8000)
+        self.ensemble_sample_count = len(samples)
         if len(samples) < 400:
+            logger.info(
+                "Local AI ensemble warming up: %s/400 labeled 30s samples available.",
+                len(samples),
+            )
             return
         from concurrent.futures import ThreadPoolExecutor
 
         loop = asyncio.get_running_loop()
         with ThreadPoolExecutor(max_workers=1) as pool:
-            await loop.run_in_executor(pool, self.ensemble.maybe_retrain, samples)
+            trained = await loop.run_in_executor(pool, self.ensemble.maybe_retrain, samples)
+        if not trained and not self.ensemble.is_ready:
+            logger.warning(
+                "Local AI ensemble is not ready; %s labeled samples loaded but training did not complete.",
+                len(samples),
+            )
 
     def check_database(self) -> None:
         """Fail loudly and clearly if Supabase is mis-set-up (wrong key / missing tables)."""
@@ -929,6 +943,7 @@ class EOLivePredictorBot:
         await db(self.check_database)
         await db(self.restore_model_state)
         await db(self.restore_learning_history)
+        await self.maybe_retrain_ensemble()
         await self.feed.start()
 
         tasks = [
@@ -1079,18 +1094,76 @@ class EOLivePredictorBot:
                 if self.trading_unlocked and self.feed.has_fresh_price() and self.feed.has_full_price_window():
                     prices = self.feed.get_latest_prices(SEQUENCE_LENGTH)
                     features = self.jarvis.extract_features(prices)
+                    model_source = "online_logistic"
+                    probability = 0.5
+                    prediction_edge = 0.0
+                    reason = "model abstained"
                     if self.ensemble is not None and self.ensemble.is_ready and features is not None:
                         pred = self.ensemble.predict(features)
+                        model_source = "lightgbm_mlp_ensemble"
                         decision = pred.direction
                         score = pred.edge
+                        probability = pred.proba
+                        prediction_edge = pred.edge
                         confidence = pred.confidence
-                        if confidence not in ("Medium", "High") or not self.jarvis.gate_allows():
+                        if confidence not in ("Medium", "High"):
+                            reason = "ensemble confidence below signal threshold"
                             decision = 0
+                        elif not self.jarvis.gate_allows():
+                            reason = "outcome gate blocked"
+                            decision = 0
+                        else:
+                            reason = ""
                         expiration = TRADE_EXPIRATION_SECONDS
                     else:
                         decision, score, expiration, confidence = self.jarvis.evaluate_sequence(prices)
+                        probability = score + 0.5
+                        prediction_edge = score
+                        if self.jarvis.model.n_updates < MIN_TRAIN_SAMPLES:
+                            if features is not None:
+                                probability = self.jarvis.model.predict_proba(features)
+                                prediction_edge = probability - 0.5
+                            reason = (
+                                f"online learner warming up: "
+                                f"{self.jarvis.model.n_updates}/{MIN_TRAIN_SAMPLES} outcomes"
+                            )
+                        elif confidence == "Low":
+                            reason = "edge/confidence below signal threshold or outcome gate blocked"
+                        else:
+                            reason = ""
                     price = prices[-1]
                     since_last = (datetime.now() - self.last_signal_time).total_seconds()
+                    if decision and since_last < SIGNAL_COOLDOWN_SECONDS:
+                        reason = "signal cooldown"
+
+                    self.last_ai_output = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source": model_source,
+                        "ready": (
+                            self.ensemble.is_ready
+                            if model_source == "lightgbm_mlp_ensemble" and self.ensemble is not None
+                            else self.jarvis.model.n_updates >= MIN_TRAIN_SAMPLES
+                        ),
+                        "probability_up": round(probability, 6),
+                        "edge": round(prediction_edge, 6),
+                        "confidence": confidence,
+                        "prediction_direction": (
+                            "BUY" if prediction_edge > 0 else
+                            ("SELL" if prediction_edge < 0 else None)
+                        ),
+                        "signal_candidate": bool(decision and confidence != "Low"
+                                                 and since_last >= SIGNAL_COOLDOWN_SECONDS),
+                        "reason": reason,
+                    }
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - self.last_ai_status_log_at >= 60:
+                        logger.info(
+                            "AI output: source=%s probability_up=%.4f edge=%+.4f "
+                            "confidence=%s signal_candidate=%s reason=%s",
+                            model_source, probability, prediction_edge, confidence,
+                            self.last_ai_output["signal_candidate"], reason or "eligible",
+                        )
+                        self.last_ai_status_log_at = now_monotonic
 
                     if SIGNAL_TEST_MODE and score != 0 and \
                             (datetime.now() - self.last_test_time).total_seconds() >= TEST_INTERVAL_SECONDS:
@@ -1258,6 +1331,10 @@ async def health():
             "fresh_price": bot.feed.has_fresh_price(),
             "model_updates_30s": bot.jarvis.model.n_updates,
             "gate": bot.jarvis.gate_status(),
+            "ensemble_enabled": bot.ensemble is not None,
+            "ensemble_status": bot.ensemble.status() if bot.ensemble is not None else "disabled",
+            "ensemble_training_samples": bot.ensemble_sample_count,
+            "last_ai_output": bot.last_ai_output,
         })
     return info
 

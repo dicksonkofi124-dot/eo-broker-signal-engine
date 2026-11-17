@@ -186,6 +186,14 @@ so the learning is saved.
 
 - **Warm-up:** no signals until about 300 samples are learned, roughly 30 to 60
   minutes of live prices. Per-horizon accuracy shows in the logs.
+- **Local AI ensemble:** LightGBM and a neural network train on at least 400
+  labeled 30-second price samples from Supabase. They run locally with the
+  installed Python libraries; no hosted AI API is used. Until the ensemble is
+  trained, the online logistic model remains the fallback.
+- **Status:** check `http://127.0.0.1:8000/` on the machine running the bot.
+  The response includes whether prices are fresh, model warm-up counts, the
+  ensemble state, and the latest AI prediction with the reason it did or did
+  not emit a paper signal.
 - **Signals:** Telegram messages like "BUY PATTERN ALERT (paper)" with the price,
   score, 30-second expiry and confidence. At most one per ~55 seconds.
 - **Resolution:** each signal is scored WIN / LOSS / TIE (or VOID if the price
@@ -255,6 +263,7 @@ swap can reduce abrupt out-of-memory failures but will make training slower.
 | `APIError` / `Supabase table ... NOT usable` | Use the **service_role** key (not anon) and run the SQL from Step 4. The bot checks this at startup and says which table failed. |
 | `find_selector.py` finds nothing | Make sure the live price is visible on screen first. Forex is **closed on weekends** (Fri evening to Sun ~22:00 UTC), so EUR/USD won't move; try again when it is open. Paste the output if it still finds nothing. |
 | PC went to sleep, bot silent | Turn off sleep in power settings, then restart the bot. |
+| No signal messages | Check `/` status and the `AI output` log line. A stale price feed, model warm-up, low model confidence, or the outcome gate can all suppress signals; the status includes the current reason. |
 | Browser hangs or crashes on launch | Install Google Chrome (google.com/chrome), then in `.env` set `BROWSER_CHANNEL=chrome` and `USER_DATA_DIR=./eo_profile_chrome`. Quit all Chrome windows first. If it still hangs: `pkill -f eo_profile`, delete the profile folder, retry. |
 | GPU / EGL errors, browser hangs | Add `BROWSER_ARGS=--disable-gpu` to `.env` (software rendering; the chart still works). |
 | `playwright install` fails | Re-run it with the `venv` active. |
