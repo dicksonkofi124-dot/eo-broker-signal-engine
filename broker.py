@@ -44,6 +44,7 @@ BROWSER_PATH = os.getenv("BROWSER_PATH", "").strip()        # or full path to a 
 BROWSER_ARGS = os.getenv("BROWSER_ARGS", "").split()          # e.g. --disable-gpu
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "").strip().lower() in ("1", "true", "yes", "on")
 ENSEMBLE_ENABLED = os.getenv("ENSEMBLE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+ENSEMBLE_CHECK_SECONDS = 1200  # how often to look at retraining (limits Supabase traffic)
 
 
 def _viewport() -> dict:
@@ -846,6 +847,11 @@ class EOLivePredictorBot:
 
             self.ensemble = DualModelEnsemble()
         self.ensemble_sample_count = 0
+        self._ens_pending: deque = deque()
+        self.ens_shadow: deque[bool] = deque(maxlen=60)   # signal-grade ensemble predictions, >= 30 s apart
+        self.ens_hits: deque[bool] = deque(maxlen=500)    # every ensemble prediction
+        self._ens_last_shadow_at: Optional[datetime] = None
+        self._ens_checked_at = 0.0
         self.last_ai_output: Optional[dict] = None
         self.last_ai_status_log_at = 0.0
         self._ensemble_samples: list[dict] = []
@@ -864,44 +870,57 @@ class EOLivePredictorBot:
         self.db_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         logger.info("Connected to Supabase.")
 
-    def load_samples_for_ensemble(self, limit: int = 5000) -> list[dict]:
-        """Pull recent learning_samples from Supabase for ensemble training."""
+    def load_samples_for_ensemble(self, pages: int = 3) -> list[dict]:
+        """Recent 30 s learning samples for ensemble training.
+
+        Filtered server-side. Supabase returns at most 1000 rows per request, so the old
+        `.limit(8000)` silently returned 1000 rows of ALL horizons (about 200 of them 30 s ones,
+        which is why the warm-up counter never reached 400). We page through instead.
+        """
+        min_move = HORIZONS[0][3]
+        samples: list[dict] = []
         try:
-            resp = (
-                self.db_client.table("learning_samples")
-                .select("features, label, horizon_seconds, predicted_edge")
-                .order("id", desc=True)
-                .limit(limit)
-                .execute()
-            )
-            rows = resp.data or []
-            samples = []
-            for r in rows:
-                if r.get("horizon_seconds") != TRADE_EXPIRATION_SECONDS:
-                    continue
-                feats = r.get("features")
-                label = r.get("label")
-                if feats is None or label is None:
-                    continue
-                if isinstance(feats, str):
-                    feats = json.loads(feats)
-                if len(feats) != 9:
-                    continue
-                samples.append({
-                    "features": [float(x) for x in feats],
-                    "label": int(label),
-                    "horizon_seconds": r.get("horizon_seconds"),
-                })
+            for p in range(pages):
+                lo = p * 1000
+                resp = (
+                    self.db_client.table("learning_samples")
+                    .select("features, label, entry_price, exit_price")
+                    .eq("horizon_seconds", TRADE_EXPIRATION_SECONDS)
+                    .order("id", desc=True)
+                    .range(lo, lo + 999)
+                    .execute()
+                )
+                rows = resp.data or []
+                for r in rows:
+                    feats, label = r.get("features"), r.get("label")
+                    if feats is None or label is None:
+                        continue
+                    if isinstance(feats, str):
+                        feats = json.loads(feats)
+                    if len(feats) != 9:
+                        continue
+                    try:  # same filter as the online model: ignore moves too small to mean anything
+                        if abs(float(r["exit_price"]) / float(r["entry_price"]) - 1) < min_move:
+                            continue
+                    except Exception:
+                        continue
+                    samples.append({"features": [float(x) for x in feats], "label": int(label)})
+                if len(rows) < 1000:
+                    break
             return samples
         except Exception as exc:
-            logger.error("Failed to load samples for ensemble: %s", exc)
-            return []
+            logger.error("Failed to load samples for ensemble: %s", _safe_err(exc))
+            return samples
 
     async def maybe_retrain_ensemble(self) -> None:
-        """Retrain LightGBM + Neural Net if enough new data exists."""
+        """Retrain LightGBM + Neural Net when due. Network and training both run off the event loop."""
         if self.ensemble is None:
             return
-        samples = self.load_samples_for_ensemble(limit=8000)
+        now = datetime.now(timezone.utc).timestamp()
+        if now - self._ens_checked_at < ENSEMBLE_CHECK_SECONDS:
+            return
+        self._ens_checked_at = now
+        samples = await db(lambda: self.load_samples_for_ensemble())
         self.ensemble_sample_count = len(samples)
         if len(samples) < 400:
             logger.info(
@@ -909,16 +928,51 @@ class EOLivePredictorBot:
                 len(samples),
             )
             return
-        from concurrent.futures import ThreadPoolExecutor
-
-        loop = asyncio.get_running_loop()
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            trained = await loop.run_in_executor(pool, self.ensemble.maybe_retrain, samples)
+        trained = await asyncio.to_thread(self.ensemble.maybe_retrain, samples)
         if not trained and not self.ensemble.is_ready:
             logger.warning(
                 "Local AI ensemble is not ready; %s labeled samples loaded but training did not complete.",
                 len(samples),
             )
+
+    # ---- ensemble shadow tracking: judge it on its own out-of-sample record ----
+    def _ens_add_sample(self, now: datetime, features: list[float], price: float) -> None:
+        if self.ensemble is None or not self.ensemble.is_ready:
+            return
+        pred = self.ensemble.predict(features)
+        self._ens_pending.append((now, price, pred.edge, pred.confidence))
+
+    def _ens_resolve(self, now: datetime, price: float) -> None:
+        while self._ens_pending:
+            t0, entry, edge, conf = self._ens_pending[0]
+            age = (now - t0).total_seconds()
+            if age < TRADE_EXPIRATION_SECONDS:
+                break
+            self._ens_pending.popleft()
+            if age > TRADE_EXPIRATION_SECONDS + 10 or price == entry or edge == 0:
+                continue
+            correct = (edge > 0) == (price > entry)
+            self.ens_hits.append(correct)
+            if conf in ("Medium", "High") and (
+                self._ens_last_shadow_at is None
+                or (now - self._ens_last_shadow_at).total_seconds() >= TRADE_EXPIRATION_SECONDS
+            ):
+                self._ens_last_shadow_at = now
+                self.ens_shadow.append(correct)
+
+    def _ens_gate_allows(self) -> bool:
+        o = list(self.ens_shadow)
+        if SIGNAL_GATE == "off":
+            return True
+        if SIGNAL_GATE == "strict":
+            return len(o) >= 30 and JarvisLearningModule.wilson_lower_bound(o) >= 0.5
+        return not (len(o) >= 30 and JarvisLearningModule.wilson_upper_bound(o) < 0.5)
+
+    def _ens_gate_status(self) -> str:
+        o = list(self.ens_shadow)
+        wr = f"win={100 * sum(o) / len(o):.0f}% n={len(o)}" if o else "no data yet"
+        return (f"ensemble {SIGNAL_GATE}:{'open' if self._ens_gate_allows() else 'BLOCKED'}"
+                f"({wr}, breakeven={100 * BREAKEVEN:.0f}%)")
 
     def check_database(self) -> None:
         """Fail loudly and clearly if Supabase is mis-set-up (wrong key / missing tables)."""
@@ -1077,7 +1131,7 @@ class EOLivePredictorBot:
             await db(lambda: self.db_client.table("paper_trades").insert({
                 "asset_pair": asset_pair,
                 "direction": direction,
-                "entry_price": round(price, 5),
+                "entry_price": round(price, 6),
                 "pytorch_output": round(score, 4),
                 "status": "PENDING",
                 # our own clock, so resolution uses the same timebase as price history
@@ -1094,6 +1148,7 @@ class EOLivePredictorBot:
                 if self.trading_unlocked and self.feed.has_fresh_price() and self.feed.has_full_price_window():
                     prices = self.feed.get_latest_prices(SEQUENCE_LENGTH)
                     features = self.jarvis.extract_features(prices)
+                    gate_text = self.jarvis.gate_status()
                     model_source = "online_logistic"
                     probability = 0.5
                     prediction_edge = 0.0
@@ -1101,6 +1156,7 @@ class EOLivePredictorBot:
                     if self.ensemble is not None and self.ensemble.is_ready and features is not None:
                         pred = self.ensemble.predict(features)
                         model_source = "lightgbm_mlp_ensemble"
+                        gate_text = self._ens_gate_status()
                         decision = pred.direction
                         score = pred.edge
                         probability = pred.proba
@@ -1109,8 +1165,8 @@ class EOLivePredictorBot:
                         if confidence not in ("Medium", "High"):
                             reason = "ensemble confidence below signal threshold"
                             decision = 0
-                        elif not self.jarvis.gate_allows():
-                            reason = "outcome gate blocked"
+                        elif not self._ens_gate_allows():
+                            reason = "ensemble outcome gate blocked"
                             decision = 0
                         else:
                             reason = ""
@@ -1181,7 +1237,7 @@ class EOLivePredictorBot:
                             await asyncio.sleep(1)
                             continue
                         msg = format_signal(direction, price, score, expiration,
-                                            confidence=confidence, gate=self.jarvis.gate_status())
+                                            confidence=confidence, gate=gate_text)
                         await broadcast_telegram(msg, self.db_client, self.subscribers)
             except Exception as exc:
                 logger.error("Execution loop error: %s", exc)
@@ -1211,9 +1267,12 @@ class EOLivePredictorBot:
                             features = self.jarvis.extract_features(window)
                             if features is not None:
                                 tracker.add_sample(now, features, price)
+                                if tracker.window_seconds is None:
+                                    self._ens_add_sample(now, features, price)
 
                     for tracker in self.trackers:
                         self.sample_buffer.extend(tracker.resolve(now, price))
+                    self._ens_resolve(now, price)
 
                     if len(self.sample_buffer) > SAMPLE_BUFFER_MAX:
                         self.sample_buffer = self.sample_buffer[-SAMPLE_BUFFER_MAX:]
@@ -1252,10 +1311,10 @@ class EOLivePredictorBot:
                     entry = float(trade["entry_price"])
                     score = float(trade.get("pytorch_output") or 0)
                     was_win = (direction == "BUY" and exit_price > entry) or (direction == "SELL" and exit_price < entry)
-                    result = "TIE" if exit_price == entry else ("WIN" if was_win else "LOSS")
+                    result = "TIE" if round(exit_price, 5) == round(entry, 5) else ("WIN" if was_win else "LOSS")
 
                     upd = await db(lambda: self.db_client.table("paper_trades").update(
-                        {"status": result, "exit_price": round(exit_price, 5)}
+                        {"status": result, "exit_price": round(exit_price, 6)}
                     ).eq("id", trade_id).eq("status", "PENDING").execute())
                     if not upd.data:
                         continue  # another instance resolved it first
@@ -1281,6 +1340,12 @@ class EOLivePredictorBot:
                     self.last_model_save = now
                     for t in self.trackers:
                         logger.info(t.summary())
+                    if self.ensemble is not None:
+                        h, sh = list(self.ens_hits), list(self.ens_shadow)
+                        logger.info("%s | all predictions: %s | signal-grade: %s",
+                                    self.ensemble.status(),
+                                    f"{100 * sum(h) / len(h):.1f}% (n={len(h)})" if h else "n/a",
+                                    f"{100 * sum(sh) / len(sh):.1f}% (n={len(sh)})" if sh else "n/a")
             except Exception as exc:
                 logger.error("Maintenance error: %s", exc)
             await asyncio.sleep(SAMPLE_FLUSH_SECONDS)
@@ -1334,6 +1399,10 @@ async def health():
             "ensemble_enabled": bot.ensemble is not None,
             "ensemble_status": bot.ensemble.status() if bot.ensemble is not None else "disabled",
             "ensemble_training_samples": bot.ensemble_sample_count,
+            "ensemble_signal_grade_record": (
+                f"{sum(bot.ens_shadow)}/{len(bot.ens_shadow)}" if bot.ens_shadow else "none yet"),
+            "ensemble_all_predictions_record": (
+                f"{sum(bot.ens_hits)}/{len(bot.ens_hits)}" if bot.ens_hits else "none yet"),
             "last_ai_output": bot.last_ai_output,
         })
     return info

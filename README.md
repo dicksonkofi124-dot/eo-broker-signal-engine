@@ -288,3 +288,21 @@ swap can reduce abrupt out-of-memory failures but will make training slower.
 - Trades are scored at the price exactly 30 seconds after entry.
 - Model: 9 features, forgetting statistics, gradient clipping. Saved model id is `eobroker_live_v2`, so it starts fresh.
 - `strict` gate now requires a proven edge (lower 95% bound at or above 50%).
+
+## Ensemble gate and warm-up (important)
+
+- When the LightGBM + neural-network ensemble is ready, it (not the online logistic
+  model) produces the signals. `SIGNAL_GATE` now judges the ensemble on its OWN
+  out-of-sample record: every 5 s it predicts, 30 s later the result is scored, and
+  `strict` only lets signals through after at least 30 scored Medium/High predictions
+  whose lower 95% bound is above 50%. See `ensemble_signal_grade_record` on the status
+  page and the `Ensemble(...)` log line.
+- Warm-up fix: Supabase returns at most 1000 rows per request, so the old loader (limit
+  8000, all horizons) only ever saw about 200 usable 30 s samples and never reached 400.
+  The loader now filters to 30 s rows on the server and pages through 3000 rows. It
+  checks for retraining at most every 20 minutes, off the main loop.
+- Ties are decided at 5 decimals (what the chart shows); entry prices are stored with 6.
+- Treat any accuracy number as meaningful only with several hundred scored predictions.
+  The per-horizon lines in the log use overlapping samples and are not reliable.
+
+Server setup: see `DEPLOY_ORACLE.md`.
