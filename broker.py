@@ -63,6 +63,8 @@ PRICE_MIN = float(os.getenv("PRICE_MIN", "0") or 0)       # sanity range, e.g. 0
 PRICE_MAX = float(os.getenv("PRICE_MAX", "0") or 0)             # e.g. 1.4 ; 0 = no range check
 
 SIGNAL_GATE = os.getenv("SIGNAL_GATE", "relaxed").lower()  # off|relaxed|strict
+_raw_hours = os.getenv("ALLOWED_UTC_HOURS", "").strip()
+ALLOWED_UTC_HOURS = {int(h.strip()) for h in _raw_hours.split(",") if h.strip().isdigit()}
 EDGE_MODE = os.getenv("EDGE_MODE", "adaptive").lower()
 
 
@@ -717,6 +719,8 @@ class JarvisLearningModule:
         self.shadow_memory.append(bool(correct))
 
     def gate_allows(self) -> bool:
+        if ALLOWED_UTC_HOURS and datetime.now(timezone.utc).hour not in ALLOWED_UTC_HOURS:
+            return False
         outcomes = list(self.shadow_memory)
         if SIGNAL_GATE == "off":
             return True
@@ -982,6 +986,8 @@ class EOLivePredictorBot:
                 self.ens_shadow.append(correct)
 
     def _ens_gate_allows(self) -> bool:
+        if ALLOWED_UTC_HOURS and datetime.now(timezone.utc).hour not in ALLOWED_UTC_HOURS:
+            return False
         o = list(self.ens_shadow)
         if SIGNAL_GATE == "off":
             return True
