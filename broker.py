@@ -309,6 +309,27 @@ class PlaywrightScraperFeed:
             self.context.on("page", lambda pg: pg.on("websocket", self._on_ws))
         logger.info("Browser ready. Log in manually if needed, then open the EUR/USD chart.")
         await self.page.goto("https://expertoption.com", timeout=90_000)
+        asyncio.create_task(self._auto_enter_platform())
+
+    async def _auto_enter_platform(self) -> None:
+        for _ in range(15):
+            await asyncio.sleep(2)
+            if self._ever_had_price or self.page is None or self.page.is_closed():
+                break
+            try:
+                trade_btn = self.page.locator("a:has-text('Trade Now'), button:has-text('Trade Now')").first
+                if await trade_btn.count() > 0 and await trade_btn.is_visible(timeout=500):
+                    await trade_btn.click()
+                    logger.info("Clicked 'Trade Now' automatically.")
+                    await asyncio.sleep(3)
+                await self.page.keyboard.press("Escape")
+                for sel in ("[class*='modal'] [class*='close']", "[class*='popup'] [class*='close']", "button[aria-label='Close']"):
+                    btn = self.page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_visible(timeout=300):
+                        await btn.click()
+                        logger.info("Dismissed popup/deposit modal automatically.")
+            except Exception:
+                pass
 
     # ---- websocket price source (read-only: only incoming market ticks are used) ----
     def _on_ws(self, ws) -> None:

@@ -306,3 +306,26 @@ swap can reduce abrupt out-of-memory failures but will make training slower.
   The per-horizon lines in the log use overlapping samples and are not reliable.
 
 Server setup: see `DEPLOY_ORACLE.md`.
+
+## Quick cheat sheet for checking the server
+
+You do not need Windows App or an open terminal for normal operation. Use SSH
+from your Mac when you want to check the server.
+
+Check live bot and AI status:
+
+```bash
+curl -s http://localhost:8000/ | python3 -m json.tool
+```
+
+View live bot logs (press Ctrl+C to exit the viewer):
+
+```bash
+journalctl -u eo-broker -f
+```
+
+Pull future GitHub updates and restart cleanly:
+
+```bash
+cd ~/eo-broker-signal-engine && git pull --ff-only origin main && sudo systemctl restart eo-broker
+```
