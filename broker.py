@@ -315,22 +315,20 @@ class PlaywrightScraperFeed:
 
     async def _notify_owner_login(self, reason: str) -> None:
         now = time.monotonic()
-        if now - getattr(self, '_last_login_alert_at', 0.0) < 1800:
+        if now - getattr(self, "_last_login_alert_at", 0.0) < 1800:
             return
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return
         self._last_login_alert_at = now
         msg = (
-            f"🔐 <b>Manual Login Required</b>
-"
-            f"Reason: {reason}
-"
-            f"Open Windows App (<code>84.12.112.16</code>) to sign back into Expert Option."
+            "🔐 <b>Manual Login Required</b>\n"
+            f"Reason: {reason}\n"
+            "Open Windows App (<code>84.12.112.16</code>) to sign back into Expert Option."
         )
         try:
             async with httpx.AsyncClient(timeout=12) as client:
                 await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage",
                     json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
                 )
             logger.warning("Sent owner-only manual login alert to TELEGRAM_CHAT_ID.")
@@ -349,18 +347,15 @@ class PlaywrightScraperFeed:
                     logger.info("Clicked 'Trade Now' automatically.")
                     await asyncio.sleep(3)
                 await self.page.keyboard.press("Escape")
+                if "/login" in self.page.url or await self.page.locator("input[type=password]").count() > 0:
+                    await self._notify_owner_login("Login screen detected in browser.")
                 for sel in ("[class*='modal'] [class*='close']", "[class*='popup'] [class*='close']", "button[aria-label='Close']"):
                     btn = self.page.locator(sel).first
                     if await btn.count() > 0 and await btn.is_visible(timeout=300):
                         await btn.click()
                         logger.info("Dismissed popup/deposit modal automatically.")
-                pwd = self.page.locator("input[type='password']").first
-                if await pwd.count() > 0 and await pwd.is_visible(timeout=300):
-                    await self._notify_owner_login("Login screen detected in browser.")
             except Exception:
                 pass
-        if not self._ever_had_price and self._frames_seen == 0:
-            await self._notify_owner_login("No market stream after 30s — session may have logged out.")
 
     # ---- websocket price source (read-only: only incoming market ticks are used) ----
     def _on_ws(self, ws) -> None:
