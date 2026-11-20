@@ -329,3 +329,28 @@ Pull future GitHub updates and restart cleanly:
 ```bash
 cd ~/eo-broker-signal-engine && git pull --ff-only origin main && sudo systemctl restart eo-broker
 ```
+
+## Manual Login Recovery (When Alerted on Telegram)
+
+When you receive the manual login alert on Telegram, stop the background service first so you can open the browser on your Remote Desktop, sign in, and hand control back to the 24/7 service. *(Two Chromium windows cannot share the `eo_profile` login folder at the same time.)*
+
+### Step 1: Stop the Background Service (From Your Mac Terminal)
+```bash
+ssh -i ~/Downloads/ssh-key-2026-11-17.key ubuntu@84.12.112.16 "sudo systemctl stop eo-broker"
+```
+
+### Step 2: Open Windows App & Launch the Visible Browser
+1. Open **Windows App** on your Mac (or iPhone) and connect to **`84.12.112.16`**.
+2. Open the **Terminal Emulator** inside your Ubuntu desktop and run:
+   ```bash
+   cd ~/eo-broker-signal-engine && source .venv/bin/activate && python broker.py
+   ```
+3. Chromium will pop up on your screen—**log into Expert Option**, complete any verification code or CAPTCHA, and make sure the **EUR/USD** chart is open.
+
+### Step 3: Hand Control Back to the 24/7 Service
+1. Once you see **`First price received: ...`** in the desktop terminal, click inside that terminal and press **Ctrl + C** to close the manual browser and save your updated login cookies.
+2. Start the background service again right from that same terminal:
+   ```bash
+   sudo systemctl start eo-broker
+   ```
+3. Close the **Windows App** window (click the red `X`—never click "Shut Down" inside Ubuntu).
