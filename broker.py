@@ -123,7 +123,7 @@ SIGNAL_COOLDOWN_SECONDS = 55
 BROWSER_HEALTH_CHECK_INTERVAL = 30
 PRICE_STALE_SECONDS = 20
 MAX_RELOADS_BEFORE_RELAUNCH = 2
-MAX_BROWSER_RESTARTS = 10
+MAX_BROWSER_RESTARTS = 10000
 MAX_PRICE_JUMP = 0.05  # reject >5% tick-to-tick jumps as mis-scrapes
 JUMP_ACCEPT_AFTER = 8  # ...unless it persists (asset switched)
 
@@ -313,6 +313,30 @@ class PlaywrightScraperFeed:
         await self.page.goto("https://expertoption.com", timeout=90_000)
         asyncio.create_task(self._auto_enter_platform())
 
+    async def _notify_owner_login(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - getattr(self, '_last_login_alert_at', 0.0) < 1800:
+            return
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        self._last_login_alert_at = now
+        msg = (
+            f"🔐 <b>Manual Login Required</b>
+"
+            f"Reason: {reason}
+"
+            f"Open Windows App (<code>84.12.112.16</code>) to sign back into Expert Option."
+        )
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                )
+            logger.warning("Sent owner-only manual login alert to TELEGRAM_CHAT_ID.")
+        except Exception as exc:
+            logger.error("Failed to send owner login alert: %s", exc)
+
     async def _auto_enter_platform(self) -> None:
         for _ in range(15):
             await asyncio.sleep(2)
@@ -330,8 +354,13 @@ class PlaywrightScraperFeed:
                     if await btn.count() > 0 and await btn.is_visible(timeout=300):
                         await btn.click()
                         logger.info("Dismissed popup/deposit modal automatically.")
+                pwd = self.page.locator("input[type='password']").first
+                if await pwd.count() > 0 and await pwd.is_visible(timeout=300):
+                    await self._notify_owner_login("Login screen detected in browser.")
             except Exception:
                 pass
+        if not self._ever_had_price and self._frames_seen == 0:
+            await self._notify_owner_login("No market stream after 30s — session may have logged out.")
 
     # ---- websocket price source (read-only: only incoming market ticks are used) ----
     def _on_ws(self, ws) -> None:

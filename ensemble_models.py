@@ -23,7 +23,7 @@ N_FEATURES = 9
 MIN_SAMPLES_TO_TRAIN = 400
 RETRAIN_EVERY_SAMPLES = 250
 RETRAIN_EVERY_SECONDS = 20 * 60
-MIN_AGREEMENT_EDGE = 0.05
+MIN_AGREEMENT_EDGE = 0.015
 ENSEMBLE_WEIGHT_LGB = 0.60
 ENSEMBLE_WEIGHT_NN = 0.40
 
@@ -135,9 +135,9 @@ class DualModelEnsemble:
         if lgb_p is not None and nn_p is not None:
             agreement = ((lgb_p - 0.5) * (nn_p - 0.5) > 0) and (abs(lgb_p - 0.5) >= MIN_AGREEMENT_EDGE) and (abs(nn_p - 0.5) >= MIN_AGREEMENT_EDGE)
         direction, confidence, abs_edge = 0, "Low", abs(edge)
-        if agreement and abs_edge >= 0.10:
+        if agreement and abs_edge >= 0.035:
             direction = 1 if edge > 0 else -1; confidence = "High"
-        elif agreement and abs_edge >= 0.06:
+        elif agreement and abs_edge >= 0.02:
             direction = 1 if edge > 0 else -1; confidence = "Medium"
         elif abs_edge >= 0.04:
             direction = 1 if edge > 0 else -1; confidence = "Low"
