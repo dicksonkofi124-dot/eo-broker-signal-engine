@@ -243,17 +243,17 @@ swap can reduce abrupt out-of-memory failures but will make training slower.
 
 ## Telegram commands
 
--  - subscribes to paper-trading signals
--  - unsubscribes from signals
--  - sends a live status card
--  - manually pauses all live signals
--  - re-enables signals and clears cooldowns
+- `/start` - subscribes to paper-trading signals
+- `/stop` - unsubscribes from signals
+- `/stats` - *(owner-only)* sends a live status card
+- `/pause` - *(owner-only)* manually pauses all live signals
+- `/resume` - *(owner-only)* re-enables signals and clears cooldowns
 
 ## Signal Filters, Risk Guards & Automated Reports
 
-- **Trend & Overlap Guards:** Filters trades against 15-minute slope and prevents overlapping entries.
-- **Drawdown & Volatility Breakers:** Pauses signals on consecutive losses, daily drawdown limits (-3.0u), or volatility spikes.
-- **Schedule & Digest:** Restricts signals to active UTC windows and sends a daily 23:05 UTC digest.
+- **Trend & Overlap Guards:** Filters trades against 15-minute slope (`±0.15`) and prevents overlapping active trades.
+- **Drawdown & Volatility Breakers:** Pauses signals for 30m after 3 consecutive losses, halts for the day at `-3.0u`, or pauses 15m on volatility spikes (`> 3.0`).
+- **Schedule & Digest:** Restricts signals to active UTC windows (`08:00-09:59` and `21:00-22:59 UTC`) and sends a daily `23:05 UTC` digest.
 
 ## Troubleshooting
 
