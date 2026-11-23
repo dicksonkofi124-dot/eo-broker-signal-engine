@@ -1139,6 +1139,27 @@ class EOLivePredictorBot:
                 logger.info("Trading unlocked – observation period complete.")
             await asyncio.sleep(0.5)
 
+    async def _send_owner_stats(self, cid: str) -> None:
+        sh, ht = list(self.ens_shadow), list(self.ens_hits)
+        w15 = self.feed.get_window(900)
+        f15 = self.jarvis.extract_features(w15) if w15 else None
+        t15 = f'{next(iter(f15)):+.2f}' if f15 else 'warming up'
+        st = f'{sum(sh)}/{len(sh)} ({100*sum(sh)/len(sh):.1f}%)' if sh else 'none yet'
+        ht_s = f'{sum(ht)}/{len(ht)} ({100*sum(ht)/len(ht):.1f}%)' if ht else 'none yet'
+        fd = 'Live' if self.feed.has_fresh_price() else 'Stale'
+        hr = 'OPEN' if datetime.now(timezone.utc).hour in {8, 9, 21, 22} else 'MUTED'
+        tm = datetime.now(timezone.utc).strftime('%H:%M')
+        rep = (
+            f'📊 <b>EO 5m AI Stats</b>\n'
+            f'• Feed: {fd}\n'
+            f'• UTC: {tm} ({hr})\n'
+            f'• Gate: <code>{self._ens_gate_status()}</code>\n'
+            f'• 5m Signal-Grade: {st}\n'
+            f'• 5m All Shadow: {ht_s}\n'
+            f'• 15m Slope: <code>{t15}</code>'
+        )
+        await broadcast_telegram(rep, self.db_client, {cid})
+
     async def telegram_listener_loop(self) -> None:
         offset = 0
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -1171,6 +1192,8 @@ class EOLivePredictorBot:
                                 await db(lambda: self.db_client.table("bot_users").delete().eq("chat_id", chat_id).execute())
                             except Exception as exc:
                                 logger.error("Error removing subscriber: %s", _safe_err(exc))
+                        elif command == "/stats" and chat_id == TELEGRAM_CHAT_ID:
+                            await self._send_owner_stats(chat_id)
             except Exception as exc:
                 logger.warning("Telegram listener error: %s", _safe_err(exc))
                 await asyncio.sleep(5)
@@ -1192,6 +1215,21 @@ class EOLivePredictorBot:
         except Exception as exc:
             logger.error("DB insertion fault: %s", _safe_err(exc))
             return False
+
+    def _check_filters(self, dec: int, feat) -> tuple:
+        vol = tuple(feat).__getitem__(6)
+        if vol > 3.0:
+            self._vol_pause_until = time.monotonic() + 900
+            return 0, f'volatility spike breaker (vol={vol:.2f})'
+        if time.monotonic() < getattr(self, '_vol_pause_until', 0.0):
+            return 0, 'volatility spike cooldown'
+        w15 = self.feed.get_window(900)
+        f15 = self.jarvis.extract_features(w15) if w15 else None
+        if f15 is not None:
+            s15 = next(iter(f15))
+            if (dec == 1 and s15 < -0.15) or (dec == -1 and s15 > 0.15):
+                return 0, f'15m trend conflict (slope={s15:+.2f})'
+        return dec, ''
 
     async def execution_loop(self) -> None:
         while self.is_running:
@@ -1220,7 +1258,7 @@ class EOLivePredictorBot:
                             reason = "ensemble outcome gate blocked"
                             decision = 0
                         else:
-                            reason = ""
+                            decision, reason = self._check_filters(decision, features)
                         expiration = TRADE_EXPIRATION_SECONDS
                     else:
                         decision, score, expiration, confidence = self.jarvis.evaluate_sequence(prices)
@@ -1379,16 +1417,37 @@ class EOLivePredictorBot:
                     logger.error("Resolution loop error (x%s): %s", fails, _safe_err(exc))
             await asyncio.sleep(min(60.0, RESOLUTION_POLL_INTERVAL * (1 + fails)))
 
+    async def _maybe_send_digest(self, now: datetime) -> None:
+        d = now.date().isoformat()
+        if not (now.hour == 23 and now.minute >= 5 and getattr(self, '_last_digest_date', None) != d and TELEGRAM_CHAT_ID):
+            return
+        self._last_digest_date = d
+        ds = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        res = await db(lambda: self.db_client.table('paper_trades').select('status').gte('executed_at', ds).in_('status', ('WIN', 'LOSS')).execute())
+        rows = res.data or ()
+        w = sum(1 for r in rows if r.get('status') == 'WIN')
+        l = sum(1 for r in rows if r.get('status') == 'LOSS')
+        tot = w + l
+        wr = f'{100*w/tot:.1f}%' if tot else 'n/a'
+        msg = (
+            f'📈 <b>Daily 5m Digest ({d})</b>\n'
+            f'• Trades: {tot} ({w}W / {l}L)\n'
+            f'• Win Rate: <b>{wr}</b>\n'
+            f'• Shadow: {sum(self.ens_shadow)}/{len(self.ens_shadow)}'
+        )
+        await broadcast_telegram(msg, self.db_client, {TELEGRAM_CHAT_ID})
+
     async def periodic_maintenance(self) -> None:
         while self.is_running:
             try:
                 await self.flush_samples()
                 if time.monotonic() - getattr(self, "_last_db_prune_at", 0.0) >= 86400:
                     self._last_db_prune_at = time.monotonic()
-                    cutoff = (utc_now() - timedelta(days=14)).isoformat()
+                    cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
                     await db(lambda: self.db_client.table("learning_samples").delete().lt("created_at", cutoff).execute())
                     logger.info("Pruned learning_samples older than 14 days.")
                 now = datetime.now(timezone.utc)
+                await self._maybe_send_digest(now)
                 if (now - self.last_model_save).total_seconds() >= MODEL_SAVE_SECONDS:
                     snapshot = self.model_state_snapshot()
                     await db(lambda: self.save_model_state(snapshot))
