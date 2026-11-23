@@ -1140,6 +1140,16 @@ class EOLivePredictorBot:
             await asyncio.sleep(0.5)
 
     async def _send_owner_stats(self, cid: str) -> None:
+        now = datetime.now(timezone.utc)
+        ds = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        res = await db(lambda: self.db_client.table('paper_trades').select('status').gte('executed_at', ds).in_('status', ('WIN', 'LOSS')).execute())
+        rows = res.data or ()
+        w = sum(1 for r in rows if r.get('status') == 'WIN')
+        l = sum(1 for r in rows if r.get('status') == 'LOSS')
+        tot = w + l
+        payout = float(globals().get('PAYOUT', 0.85))
+        pnl = w * payout - l
+        td_txt = f'{w}W / {l}L ({100*w/tot:.1f}% | {pnl:+.2f}u)' if tot else '0 trades yet'
         sh, ht = list(self.ens_shadow), list(self.ens_hits)
         w15 = self.feed.get_window(900)
         f15 = self.jarvis.extract_features(w15) if w15 else None
@@ -1147,12 +1157,13 @@ class EOLivePredictorBot:
         st = f'{sum(sh)}/{len(sh)} ({100*sum(sh)/len(sh):.1f}%)' if sh else 'none yet'
         ht_s = f'{sum(ht)}/{len(ht)} ({100*sum(ht)/len(ht):.1f}%)' if ht else 'none yet'
         fd = 'Live' if self.feed.has_fresh_price() else 'Stale'
-        hr = 'OPEN' if datetime.now(timezone.utc).hour in {8, 9, 21, 22} else 'MUTED'
-        tm = datetime.now(timezone.utc).strftime('%H:%M')
+        hr = 'OPEN' if now.hour in {8, 9, 21, 22} else 'MUTED'
+        tm = now.strftime('%H:%M')
         rep = (
             f'📊 <b>EO 5m AI Stats</b>\n'
             f'• Feed: {fd}\n'
             f'• UTC: {tm} ({hr})\n'
+            f'• Today: <b>{td_txt}</b>\n'
             f'• Gate: <code>{self._ens_gate_status()}</code>\n'
             f'• 5m Signal-Grade: {st}\n'
             f'• 5m All Shadow: {ht_s}\n'
