@@ -243,18 +243,17 @@ swap can reduce abrupt out-of-memory failures but will make training slower.
 
 ## Telegram commands
 
-- `/start` - subscribes a chat to paper-trading signals
-- `/stop` - unsubscribes a chat from signals
-- `/stats` - *(owner-only)* sends a live status card with feed health, active UTC window status, daily W/L record, win rate, net PnL (in units), ensemble gate status, shadow accuracy, and 15-minute trend slope
+-  - subscribes to paper-trading signals
+-  - unsubscribes from signals
+-  - sends a live status card
+-  - manually pauses all live signals
+-  - re-enables signals and clears cooldowns
 
-## Signal Filters & Automated Reports
+## Signal Filters, Risk Guards & Automated Reports
 
-- **15-Minute Trend Alignment:** Blocks 5m signals when the 15-minute price slope opposes the trade direction (`slope < -0.15` for BUY, `slope > +0.15` for SELL).
-- **Volatility Spike Circuit-Breaker:** Automatically pauses signals for 15 minutes if short-term volatility exceeds `3.0`.
-- **Active UTC Schedule:** Signals are restricted to configured active trading hours (`08:00-09:59` and `21:00-22:59 UTC`).
-- **Daily Digest (`23:05 UTC`):** Sends an automated end-of-day Telegram summary to `TELEGRAM_CHAT_ID` covering total resolved trades, win rate, and shadow accuracy.
-
----
+- **Trend & Overlap Guards:** Filters trades against 15-minute slope and prevents overlapping entries.
+- **Drawdown & Volatility Breakers:** Pauses signals on consecutive losses, daily drawdown limits (-3.0u), or volatility spikes.
+- **Schedule & Digest:** Restricts signals to active UTC windows and sends a daily 23:05 UTC digest.
 
 ## Troubleshooting
 
