@@ -1185,6 +1185,18 @@ class EOLivePredictorBot:
     async def telegram_listener_loop(self) -> None:
         offset = 0
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        try:
+            async with httpx.AsyncClient(timeout=15) as c_init:
+                cmds = [
+                    {"command": "start", "description": "Subscribe to paper-trading signals"},
+                    {"command": "stop", "description": "Unsubscribe from signals"},
+                    {"command": "stats", "description": "View live AI status, daily & all-time PnL"},
+                    {"command": "pause", "description": "Manually pause all live signals"},
+                    {"command": "resume", "description": "Resume signals and clear cooldowns"},
+                ]
+                await c_init.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands", json={"commands": cmds})
+        except Exception as exc:
+            logger.warning("Failed to register Telegram menu: %s", _safe_err(exc))
         while self.is_running:
             try:
                 async with httpx.AsyncClient(timeout=45) as client:
@@ -1208,7 +1220,7 @@ class EOLivePredictorBot:
                                                          self.db_client, {chat_id})
                             except Exception as exc:
                                 logger.error("Error registering subscriber: %s", _safe_err(exc))
-                        elif command == "/stop":
+                        elif command in ("/stop", "/end"):
                             self.subscribers.discard(chat_id)
                             try:
                                 await db(lambda: self.db_client.table("bot_users").delete().eq("chat_id", chat_id).execute())
