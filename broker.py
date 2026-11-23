@@ -1079,12 +1079,16 @@ class EOLivePredictorBot:
                         tracker.model.load_dict(saved[tracker.name])
                     except Exception as exc:
                         logger.warning("Skipping saved model %s: %s", tracker.name, exc)
-            logger.info("Model state restored.")
+            for b in response.data[0]["state"].get("ens_shadow", [])[-60:]:
+                self.ens_shadow.append(bool(b))
+            for b in response.data[0]["state"].get("ens_hits", [])[-500:]:
+                self.ens_hits.append(bool(b))
+            logger.info("Model state restored (shadow=%d).", len(self.ens_shadow))
         except Exception as exc:
             logger.error("Error restoring model state: %s", _safe_err(exc))
 
     def model_state_snapshot(self) -> dict:
-        return {"version": 3, "features": FEATURE_NAMES, "horizons": {t.name: t.model.to_dict() for t in self.trackers}}
+        return {"version": 3, "features": FEATURE_NAMES, "horizons": {t.name: t.model.to_dict() for t in self.trackers}, "ens_shadow": [bool(x) for x in self.ens_shadow], "ens_hits": [bool(x) for x in self.ens_hits]}
 
     def save_model_state(self, state: Optional[dict] = None) -> None:
         try:
@@ -1456,6 +1460,11 @@ class EOLivePredictorBot:
                     if result != "TIE" and trade.get("asset_pair") == "EO Broker Live Chart":
                         self.jarvis.learn_from_outcome(score, was_win)
                     logger.info("Resolved trade %s → %s (entry=%.5f exit=%.5f)", trade_id, result, entry, exit_price)
+                    if TELEGRAM_CHAT_ID and trade.get("asset_pair") == "EO Broker Live Chart":
+                        payout = float(globals().get("PAYOUT", 0.85))
+                        icon = "✅" if result == "WIN" else ("❌" if result == "LOSS" else "➖")
+                        u = f"+{payout:.2f}u" if result == "WIN" else ("-1.00u" if result == "LOSS" else "0.00u")
+                        await broadcast_telegram(f"{icon} <b>5m {direction} Result: {result}</b> ({u})\n• Entry: <code>{entry:.5f}</code> → Exit: <code>{exit_price:.5f}</code>", self.db_client, {TELEGRAM_CHAT_ID})
             except Exception as exc:
                 fails += 1
                 if fails <= 2 or fails % 20 == 0:
