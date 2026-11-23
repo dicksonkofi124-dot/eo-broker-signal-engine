@@ -1383,6 +1383,11 @@ class EOLivePredictorBot:
         while self.is_running:
             try:
                 await self.flush_samples()
+                if time.monotonic() - getattr(self, "_last_db_prune_at", 0.0) >= 86400:
+                    self._last_db_prune_at = time.monotonic()
+                    cutoff = (utc_now() - timedelta(days=14)).isoformat()
+                    await db(lambda: self.db_client.table("learning_samples").delete().lt("created_at", cutoff).execute())
+                    logger.info("Pruned learning_samples older than 14 days.")
                 now = datetime.now(timezone.utc)
                 if (now - self.last_model_save).total_seconds() >= MODEL_SAVE_SECONDS:
                     snapshot = self.model_state_snapshot()
