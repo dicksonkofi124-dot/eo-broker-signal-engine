@@ -1157,7 +1157,7 @@ class EOLivePredictorBot:
         st = f'{sum(sh)}/{len(sh)} ({100*sum(sh)/len(sh):.1f}%)' if sh else 'none yet'
         ht_s = f'{sum(ht)}/{len(ht)} ({100*sum(ht)/len(ht):.1f}%)' if ht else 'none yet'
         fd = 'Live' if self.feed.has_fresh_price() else 'Stale'
-        hr = 'OPEN' if now.hour in {8, 9, 21, 22} else 'MUTED'
+        hr = 'PAUSED' if getattr(self, '_manual_paused', False) else ('OPEN' if now.hour in {8, 9, 21, 22} else 'MUTED')
         tm = now.strftime('%H:%M')
         rep = (
             f'📊 <b>EO 5m AI Stats</b>\n'
@@ -1205,6 +1205,14 @@ class EOLivePredictorBot:
                                 logger.error("Error removing subscriber: %s", _safe_err(exc))
                         elif command == "/stats" and chat_id == TELEGRAM_CHAT_ID:
                             await self._send_owner_stats(chat_id)
+                        elif command == "/pause" and chat_id == TELEGRAM_CHAT_ID:
+                            self._manual_paused = True
+                            await broadcast_telegram("⏸️ <b>Signals PAUSED</b> manually. Send /resume to re-enable.", self.db_client, {chat_id})
+                        elif command == "/resume" and chat_id == TELEGRAM_CHAT_ID:
+                            self._manual_paused = False
+                            self._loss_pause_until = 0.0
+                            self._vol_pause_until = 0.0
+                            await broadcast_telegram("▶️ <b>Signals RESUMED</b>.", self.db_client, {chat_id})
             except Exception as exc:
                 logger.warning("Telegram listener error: %s", _safe_err(exc))
                 await asyncio.sleep(5)
@@ -1227,7 +1235,11 @@ class EOLivePredictorBot:
             logger.error("DB insertion fault: %s", _safe_err(exc))
             return False
 
-    def _check_filters(self, dec: int, feat) -> tuple:
+    async def _check_filters(self, dec: int, feat) -> tuple:
+        if getattr(self, '_manual_paused', False):
+            return 0, 'manually paused via /pause'
+        if time.monotonic() < getattr(self, '_loss_pause_until', 0.0):
+            return 0, '3-loss streak cooldown'
         vol = tuple(feat).__getitem__(6)
         if vol > 3.0:
             self._vol_pause_until = time.monotonic() + 900
@@ -1240,6 +1252,20 @@ class EOLivePredictorBot:
             s15 = next(iter(f15))
             if (dec == 1 and s15 < -0.15) or (dec == -1 and s15 > 0.15):
                 return 0, f'15m trend conflict (slope={s15:+.2f})'
+        now = datetime.now(timezone.utc)
+        ds = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        res = await db(lambda: self.db_client.table('paper_trades').select('status').gte('executed_at', ds).in_('status', ('WIN', 'LOSS')).order('executed_at', desc=True).execute())
+        rows = res.data or ()
+        payout = float(globals().get('PAYOUT', 0.85))
+        w = sum(1 for r in rows if r.get('status') == 'WIN')
+        l = sum(1 for r in rows if r.get('status') == 'LOSS')
+        if (w * payout - l) <= -3.0:
+            return 0, f'daily stop-loss reached ({w * payout - l:+.2f}u)'
+        if len(rows) >= 3 and all(r.get('status') == 'LOSS' for r in rows[:3]):
+            if getattr(self, '_last_streak_key', None) != len(rows):
+                self._last_streak_key = len(rows)
+                self._loss_pause_until = time.monotonic() + 1800
+                return 0, '3 consecutive losses - 30m cooldown'
         return dec, ''
 
     async def execution_loop(self) -> None:
@@ -1269,7 +1295,7 @@ class EOLivePredictorBot:
                             reason = "ensemble outcome gate blocked"
                             decision = 0
                         else:
-                            decision, reason = self._check_filters(decision, features)
+                            decision, reason = await self._check_filters(decision, features)
                         expiration = TRADE_EXPIRATION_SECONDS
                     else:
                         decision, score, expiration, confidence = self.jarvis.evaluate_sequence(prices)
@@ -1289,8 +1315,9 @@ class EOLivePredictorBot:
                             reason = ""
                     price = prices[-1]
                     since_last = (datetime.now() - self.last_signal_time).total_seconds()
-                    if decision and since_last < SIGNAL_COOLDOWN_SECONDS:
-                        reason = "signal cooldown"
+                    eff_cd = max(SIGNAL_COOLDOWN_SECONDS, TRADE_EXPIRATION_SECONDS)
+                    if decision and since_last < eff_cd:
+                        reason = "active trade / signal cooldown"
 
                     self.last_ai_output = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1308,7 +1335,7 @@ class EOLivePredictorBot:
                             ("SELL" if prediction_edge < 0 else None)
                         ),
                         "signal_candidate": bool(decision and confidence != "Low"
-                                                 and since_last >= SIGNAL_COOLDOWN_SECONDS),
+                                                 and since_last >= eff_cd),
                         "reason": reason,
                     }
                     now_monotonic = time.monotonic()
@@ -1330,7 +1357,7 @@ class EOLivePredictorBot:
                                 format_signal(direction, price, score, TRADE_EXPIRATION_SECONDS, test=True),
                                 self.db_client, self.subscribers)
 
-                    if decision != 0 and confidence != "Low" and since_last >= SIGNAL_COOLDOWN_SECONDS:
+                    if decision != 0 and confidence != "Low" and since_last >= eff_cd:
                         direction = "BUY" if decision == 1 else "SELL"
                         self.last_signal_time = datetime.now()  # set first: no double-fire on DB retry
                         if not await self.log_trade(direction, price, score):
