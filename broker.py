@@ -84,7 +84,7 @@ BREAKEVEN = 1.0 / (1.0 + PAYOUT)  # win rate needed to break even
 # ---------------------------------------------------------------------------
 SEQUENCE_LENGTH = 20
 OBSERVATION_SECONDS = 12
-TRADE_EXPIRATION_SECONDS = 30
+TRADE_EXPIRATION_SECONDS = 300
 RESOLUTION_POLL_INTERVAL = 3.0
 VOID_AFTER_SECONDS = 120  # trade older than this with no exit price -> VOID
 LEARNING_HISTORY_START_AT = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
@@ -904,8 +904,8 @@ class EOLivePredictorBot:
         self.last_ai_output: Optional[dict] = None
         self.last_ai_status_log_at = 0.0
         self._ensemble_samples: list[dict] = []
-        self.trackers[0].model = self.jarvis.model
-        self.trackers[0].on_result = self.jarvis.record_shadow
+        self.trackers[2].model = self.jarvis.model
+        self.trackers[2].on_result = self.jarvis.record_shadow
 
         self.sample_buffer: list[dict] = []
         self.subscribers: set[str] = set()
@@ -1197,7 +1197,7 @@ class EOLivePredictorBot:
         while self.is_running:
             try:
                 if self.trading_unlocked and self.feed.has_fresh_price() and self.feed.has_full_price_window():
-                    prices = self.feed.get_latest_prices(SEQUENCE_LENGTH)
+                    prices = self.feed.get_window(300) or self.feed.get_latest_prices(SEQUENCE_LENGTH)
                     features = self.jarvis.extract_features(prices)
                     gate_text = self.jarvis.gate_status()
                     model_source = "online_logistic"
@@ -1445,7 +1445,7 @@ async def health():
     if bot:
         info.update({
             "fresh_price": bot.feed.has_fresh_price(),
-            "model_updates_30s": bot.jarvis.model.n_updates,
+            "model_updates_5m": bot.jarvis.model.n_updates,
             "gate": bot.jarvis.gate_status(),
             "ensemble_enabled": bot.ensemble is not None,
             "ensemble_status": bot.ensemble.status() if bot.ensemble is not None else "disabled",
