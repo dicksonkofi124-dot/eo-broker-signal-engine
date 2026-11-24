@@ -91,6 +91,8 @@ LEARNING_HISTORY_START_AT = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
 LEARNING_HISTORY_LIMIT = 200
 
 LEARNING_SAMPLE_SECONDS = 5
+PRED_LOG_BUFFER_MAX = 2000        # unflushed prediction_logs rows kept in memory
+PRED_LOG_RETENTION_DAYS = 14      # Supabase keeps 14 days; local predictions/*.csv.gz keep everything
 MODEL_STATE_ID = "eobroker_live_v2"  # new id: feature set changed (5 -> 9)
 MODEL_SAVE_SECONDS = 300
 
@@ -287,13 +289,16 @@ def _archive_prediction_local(row: dict) -> None:
         fp = pdir / f"{day}.csv.gz"
         cols = ["predicted_at","resolved_at","utc_hour","direction","confidence","entry_price","exit_price","outcome","correct","lgb_proba","nn_proba","ensemble_proba","edge","volatility","vol_regime","gate_open","features"]
         is_new = not fp.exists()
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)  # quotes the features list, which contains commas
+        if is_new:
+            w.writerow(cols)
+        w.writerow([json.dumps(row[c]) if c == "features" else ("" if row[c] is None else row[c]) for c in cols])
         with gzip.open(fp, "at", encoding="utf-8") as fh:
-            if is_new:
-                fh.write(",".join(cols) + "\n")
-            vals = [json.dumps(row[c]) if c == "features" else ("" if row[c] is None else str(row[c])) for c in cols]
-            fh.write(",".join(vals) + "\n")
-    except Exception:
-        pass
+            fh.write(buf.getvalue())
+    except Exception as exc:
+        logger.warning("Local prediction archive write failed: %s", exc)
 
 class PlaywrightScraperFeed:
     def __init__(self) -> None:
@@ -1089,7 +1094,7 @@ class EOLivePredictorBot:
             if q is None:
                 q = []
                 self._pred_log_buffer = q
-            if len(q) < 2000:
+            if len(q) < PRED_LOG_BUFFER_MAX:
                 q.append(row)
             if price == entry or edge == 0:
                 continue
@@ -1213,7 +1218,13 @@ class EOLivePredictorBot:
                 await db(lambda: self.db_client.table("prediction_logs").insert(pbatch).execute())
                 del pbuf[: len(pbatch)]
             except Exception as exc:
-                logger.debug("Prediction log flush deferred: %s", _safe_err(exc))
+                now_m = time.monotonic()
+                if now_m - getattr(self, "_pred_flush_warn_at", -1e9) >= 600:
+                    self._pred_flush_warn_at = now_m
+                    logger.warning(
+                        "prediction_logs insert failing (%s buffered rows, cap %s; rows past the cap are dropped from "
+                        "Supabase but still saved in predictions/*.csv.gz): %s",
+                        len(pbuf), PRED_LOG_BUFFER_MAX, _safe_err(exc))
 
     def restore_learning_history(self) -> None:
         try:
@@ -1611,8 +1622,17 @@ class EOLivePredictorBot:
                 if time.monotonic() - getattr(self, "_last_db_prune_at", 0.0) >= 86400:
                     self._last_db_prune_at = time.monotonic()
                     cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
-                    await db(lambda: self.db_client.table("learning_samples").delete().lt("created_at", cutoff).execute())
-                    logger.info("Pruned learning_samples older than 14 days.")
+                    try:
+                        await db(lambda: self.db_client.table("learning_samples").delete().lt("created_at", cutoff).execute())
+                        logger.info("Pruned learning_samples older than 14 days.")
+                    except Exception as exc:
+                        logger.warning("learning_samples prune failed: %s", _safe_err(exc))
+                    pcutoff = (datetime.now(timezone.utc) - timedelta(days=PRED_LOG_RETENTION_DAYS)).isoformat()
+                    try:
+                        await db(lambda: self.db_client.table("prediction_logs").delete().lt("predicted_at", pcutoff).execute())
+                        logger.info("Pruned prediction_logs older than %s days.", PRED_LOG_RETENTION_DAYS)
+                    except Exception as exc:
+                        logger.warning("prediction_logs prune failed: %s", _safe_err(exc))
                 now = datetime.now(timezone.utc)
                 await self._maybe_send_digest(now)
                 if (now - self.last_model_save).total_seconds() >= MODEL_SAVE_SECONDS:
