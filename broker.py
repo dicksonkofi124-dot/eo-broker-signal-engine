@@ -435,6 +435,36 @@ class PlaywrightScraperFeed:
                 logger.debug("Extraction tick error (non-fatal): %s", exc)
             await asyncio.sleep(0.25)
 
+def _flush_tick_archive() -> None:
+    buf = getattr(_archive_tick, "_buf", [])
+    if not buf:
+        return
+    _archive_tick._buf = []
+    _archive_tick._last_flush = time.monotonic()
+    import gzip, pathlib
+    tdir = pathlib.Path("ticks")
+    tdir.mkdir(exist_ok=True)
+    by_day = {}
+    for day, line in buf:
+        by_day.setdefault(day, []).append(line)
+    for day, lines in by_day.items():
+        fp = tdir / f"{day}.csv.gz"
+        is_new = not fp.exists()
+        with gzip.open(fp, "at", encoding="utf-8") as fh:
+            if is_new:
+                fh.write("ts_utc,price\n")
+            fh.writelines(lines)
+
+def _archive_tick(ts_dt: datetime, val: float) -> None:
+    try:
+        buf = getattr(_archive_tick, "_buf", [])
+        buf.append((ts_dt.strftime("%Y-%m-%d"), f"{ts_dt.timestamp():.3f},{val:.6f}\n"))
+        _archive_tick._buf = buf
+        if len(buf) >= 500 or (time.monotonic() - getattr(_archive_tick, "_last_flush", 0.0)) >= 60.0:
+            _flush_tick_archive()
+    except Exception:
+        pass
+
     def _accept_price(self, val: float) -> None:
         if PRICE_MAX > 0 and not (PRICE_MIN <= val <= PRICE_MAX):
             return  # wrong element (balance, payout, %, ...) – ignore
@@ -454,6 +484,7 @@ class PlaywrightScraperFeed:
         self._ever_had_price = True
         self._reload_count = 0
         self._restart_count = 0
+        _archive_tick(self.last_update_at, val)
 
     async def _sampler_loop(self) -> None:
         while self.is_running:
@@ -1016,7 +1047,7 @@ class EOLivePredictorBot:
         if SIGNAL_GATE == "off":
             return True
         if SIGNAL_GATE == "strict":
-            return len(o) >= 30 and JarvisLearningModule.wilson_lower_bound(o) >= 0.5
+            return len(o) >= 30 and JarvisLearningModule.wilson_lower_bound(o) >= BREAKEVEN
         return not (len(o) >= 30 and JarvisLearningModule.wilson_upper_bound(o) < 0.5)
 
     def _ens_gate_status(self) -> str:
@@ -1064,6 +1095,7 @@ class EOLivePredictorBot:
         except asyncio.CancelledError:
             logger.info("Bot tasks cancelled.")
         finally:
+            _flush_tick_archive()
             for t in tasks:
                 t.cancel()
 

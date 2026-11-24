@@ -13,3 +13,4 @@ eo_profile/
 .mypy_cache/
 .ruff_cache/
 eo_profile*/
+ticks/*.csv.gz
