@@ -269,6 +269,32 @@ def _archive_tick(ts_dt: datetime, val: float) -> None:
     except Exception:
         pass
 
+def _classify_vol_regime(vol_bps: float, vol_ratio: float) -> str:
+    if vol_ratio > 3.0 or vol_bps > 4.0:
+        return "spike"
+    if vol_bps < 0.6:
+        return "low"
+    if vol_bps > 1.8:
+        return "high"
+    return "normal"
+
+def _archive_prediction_local(row: dict) -> None:
+    try:
+        import gzip, json, pathlib
+        pdir = pathlib.Path("predictions")
+        pdir.mkdir(exist_ok=True)
+        day = str(row["predicted_at"])[:10]
+        fp = pdir / f"{day}.csv.gz"
+        cols = ["predicted_at","resolved_at","utc_hour","direction","confidence","entry_price","exit_price","outcome","correct","lgb_proba","nn_proba","ensemble_proba","edge","volatility","vol_regime","gate_open","features"]
+        is_new = not fp.exists()
+        with gzip.open(fp, "at", encoding="utf-8") as fh:
+            if is_new:
+                fh.write(",".join(cols) + "\n")
+            vals = [json.dumps(row[c]) if c == "features" else ("" if row[c] is None else str(row[c])) for c in cols]
+            fh.write(",".join(vals) + "\n")
+    except Exception:
+        pass
+
 class PlaywrightScraperFeed:
     def __init__(self) -> None:
         self.playwright: Optional[Playwright] = None
@@ -1020,18 +1046,53 @@ class EOLivePredictorBot:
         if self.ensemble is None or not self.ensemble.is_ready:
             return
         pred = self.ensemble.predict(features)
-        self._ens_pending.append((now, price, pred.edge, pred.confidence))
+        self._ens_pending.append((now, price, pred, list(features), self._ens_gate_allows()))
 
     def _ens_resolve(self, now: datetime, price: float) -> None:
         while self._ens_pending:
-            t0, entry, edge, conf = self._ens_pending[0]
+            t0, entry, pred, feats, gate_open = self._ens_pending[0]
             age = (now - t0).total_seconds()
             if age < TRADE_EXPIRATION_SECONDS:
                 break
             self._ens_pending.popleft()
-            if age > TRADE_EXPIRATION_SECONDS + 10 or price == entry or edge == 0:
+            edge, conf = pred.edge, pred.confidence
+            if age > TRADE_EXPIRATION_SECONDS + 10:
                 continue
-            correct = (edge > 0) == (price > entry)
+            vol_bps = float(feats[5]) if len(feats) > 5 else 0.0
+            vol_ratio = float(feats[6]) if len(feats) > 6 else 1.0
+            if price == entry:
+                outcome, correct = "TIE", False
+            else:
+                correct = (edge > 0) == (price > entry)
+                outcome = "WIN" if correct else "LOSS"
+            row = {
+                "predicted_at": t0.isoformat(),
+                "resolved_at": now.isoformat(),
+                "utc_hour": int(t0.hour),
+                "direction": "BUY" if edge >= 0 else "SELL",
+                "confidence": conf,
+                "entry_price": round(float(entry), 6),
+                "exit_price": round(float(price), 6),
+                "outcome": outcome,
+                "correct": bool(correct),
+                "lgb_proba": round(float(pred.lgb_proba), 6) if pred.lgb_proba is not None else None,
+                "nn_proba": round(float(pred.nn_proba), 6) if pred.nn_proba is not None else None,
+                "ensemble_proba": round(float(pred.proba), 6),
+                "edge": round(float(edge), 6),
+                "volatility": round(vol_bps, 4),
+                "vol_regime": _classify_vol_regime(vol_bps, vol_ratio),
+                "gate_open": bool(gate_open),
+                "features": [round(float(x), 6) for x in feats],
+            }
+            _archive_prediction_local(row)
+            q = getattr(self, "_pred_log_buffer", None)
+            if q is None:
+                q = []
+                self._pred_log_buffer = q
+            if len(q) < 2000:
+                q.append(row)
+            if price == entry or edge == 0:
+                continue
             self.ens_hits.append(correct)
             if conf in ("Medium", "High") and (
                 self._ens_last_shadow_at is None
@@ -1145,6 +1206,14 @@ class EOLivePredictorBot:
             del self.sample_buffer[: len(batch)]
         except Exception as exc:
             logger.error("Error flushing samples: %s", _safe_err(exc))
+        pbuf = getattr(self, "_pred_log_buffer", [])
+        pbatch = pbuf[:300]
+        if pbatch:
+            try:
+                await db(lambda: self.db_client.table("prediction_logs").insert(pbatch).execute())
+                del pbuf[: len(pbatch)]
+            except Exception as exc:
+                logger.debug("Prediction log flush deferred: %s", _safe_err(exc))
 
     def restore_learning_history(self) -> None:
         try:

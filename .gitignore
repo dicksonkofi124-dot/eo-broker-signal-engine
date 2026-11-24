@@ -14,3 +14,4 @@ eo_profile/
 .ruff_cache/
 eo_profile*/
 ticks/*.csv.gz
+predictions/*.csv.gz
