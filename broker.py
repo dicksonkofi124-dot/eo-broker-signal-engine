@@ -239,6 +239,36 @@ def parse_price(text: str) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Playwright price feed with recovery
 # ---------------------------------------------------------------------------
+def _flush_tick_archive() -> None:
+    buf = getattr(_archive_tick, "_buf", [])
+    if not buf:
+        return
+    _archive_tick._buf = []
+    _archive_tick._last_flush = time.monotonic()
+    import gzip, pathlib
+    tdir = pathlib.Path("ticks")
+    tdir.mkdir(exist_ok=True)
+    by_day = {}
+    for day, line in buf:
+        by_day.setdefault(day, []).append(line)
+    for day, lines in by_day.items():
+        fp = tdir / f"{day}.csv.gz"
+        is_new = not fp.exists()
+        with gzip.open(fp, "at", encoding="utf-8") as fh:
+            if is_new:
+                fh.write("ts_utc,price\n")
+            fh.writelines(lines)
+
+def _archive_tick(ts_dt: datetime, val: float) -> None:
+    try:
+        buf = getattr(_archive_tick, "_buf", [])
+        buf.append((ts_dt.strftime("%Y-%m-%d"), f"{ts_dt.timestamp():.3f},{val:.6f}\n"))
+        _archive_tick._buf = buf
+        if len(buf) >= 500 or (time.monotonic() - getattr(_archive_tick, "_last_flush", 0.0)) >= 60.0:
+            _flush_tick_archive()
+    except Exception:
+        pass
+
 class PlaywrightScraperFeed:
     def __init__(self) -> None:
         self.playwright: Optional[Playwright] = None
@@ -434,36 +464,6 @@ class PlaywrightScraperFeed:
             except Exception as exc:
                 logger.debug("Extraction tick error (non-fatal): %s", exc)
             await asyncio.sleep(0.25)
-
-def _flush_tick_archive() -> None:
-    buf = getattr(_archive_tick, "_buf", [])
-    if not buf:
-        return
-    _archive_tick._buf = []
-    _archive_tick._last_flush = time.monotonic()
-    import gzip, pathlib
-    tdir = pathlib.Path("ticks")
-    tdir.mkdir(exist_ok=True)
-    by_day = {}
-    for day, line in buf:
-        by_day.setdefault(day, []).append(line)
-    for day, lines in by_day.items():
-        fp = tdir / f"{day}.csv.gz"
-        is_new = not fp.exists()
-        with gzip.open(fp, "at", encoding="utf-8") as fh:
-            if is_new:
-                fh.write("ts_utc,price\n")
-            fh.writelines(lines)
-
-def _archive_tick(ts_dt: datetime, val: float) -> None:
-    try:
-        buf = getattr(_archive_tick, "_buf", [])
-        buf.append((ts_dt.strftime("%Y-%m-%d"), f"{ts_dt.timestamp():.3f},{val:.6f}\n"))
-        _archive_tick._buf = buf
-        if len(buf) >= 500 or (time.monotonic() - getattr(_archive_tick, "_last_flush", 0.0)) >= 60.0:
-            _flush_tick_archive()
-    except Exception:
-        pass
 
     def _accept_price(self, val: float) -> None:
         if PRICE_MAX > 0 and not (PRICE_MIN <= val <= PRICE_MAX):

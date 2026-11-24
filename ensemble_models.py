@@ -111,7 +111,7 @@ class DualModelEnsemble:
             cal_nn = _cal(base_nn, method="sigmoid", cv=tscv)
             try:
                 cal_nn.fit(Xs, y, sample_weight=sw)
-            except TypeError:
+            except Exception:
                 cal_nn.fit(Xs, y)
             self.nn_model = cal_nn
         except Exception as exc:
