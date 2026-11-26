@@ -558,10 +558,10 @@ class PlaywrightScraperFeed:
                 continue
 
             frame_age = (now.timestamp() - self._last_frame_at) if self._last_frame_at else 1e9
-            if PRICE_SOURCE == "ws" and frame_age < 15:
+            if PRICE_SOURCE == "ws" and frame_age < 15 and age <= 120:
                 logger.warning(
                     "No EUR/USD ticks for %.0fs, but the site's data IS flowing. Is the EUR/USD chart open "
-                    "and the browser window visible (not minimised/hidden)? Not reloading.", age)
+                    "and the browser window visible (not minimised/hidden)? Waiting up to 120s before reloading.", age)
                 continue
             logger.warning("Price stale for %.0fs (last site data %.0fs ago).", age, min(frame_age, 9999))
             try:
