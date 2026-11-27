@@ -300,6 +300,19 @@ def _archive_prediction_local(row: dict) -> None:
     except Exception as exc:
         logger.warning("Local prediction archive write failed: %s", exc)
 
+def _market_closed(now: datetime) -> bool:
+    # Retail FX is shut from Friday ~21:00-22:00 UTC to Sunday ~21:00-22:00 UTC depending on US daylight time.
+    # These bounds are deliberately the certain-closed part in both seasons.
+    wd, minutes = now.weekday(), now.hour * 60 + now.minute
+    if wd == 4:
+        return minutes >= 22 * 60 + 15
+    if wd == 5:
+        return True
+    if wd == 6:
+        return minutes < 21 * 60 + 45
+    return False
+
+
 async def _select_favorite_eurusd(page) -> bool:
     """Open Assets (Favorites/Search) and select active spot EUR/USD only (skipping OTC)."""
     if page is None or page.is_closed():
@@ -624,6 +637,12 @@ class PlaywrightScraperFeed:
 
             age = (now - self.last_update_at).total_seconds() if self.last_update_at else 1e9
             if age <= PRICE_STALE_SECONDS:
+                continue
+
+            if _market_closed(now):
+                if now.timestamp() - getattr(self, "_closed_logged_at", 0.0) >= 3600:
+                    self._closed_logged_at = now.timestamp()
+                    logger.info("FX market closed for the weekend: feed recovery paused until Sunday about 21:45 UTC.")
                 continue
 
             if not ASSET_ID:
