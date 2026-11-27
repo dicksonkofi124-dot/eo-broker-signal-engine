@@ -52,6 +52,11 @@ def load(paths):
                 r["entry"], r["exit"] = fnum(r["entry_price"]), fnum(r["exit_price"])
                 r["proba"] = fnum(r["ensemble_proba"])
                 r["gate_bool"] = r["gate_open"].strip().lower() == "true"
+                if (r["entry"] is not None and not (1.00 <= r["entry"] <= 1.18)) or (
+                    r["exit"] is not None and not (1.00 <= r["exit"] <= 1.18)
+                ):
+                    bad += 1
+                    continue
                 rows.append(r)
     rows.sort(key=lambda r: r["t"])
     return rows, bad

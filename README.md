@@ -116,8 +116,8 @@ SUPABASE_KEY=your-service_role-key
 TELEGRAM_BOT_TOKEN=123456789:ABC...
 TELEGRAM_CHAT_ID=your-numeric-id
 
-PRICE_MIN=0.9
-PRICE_MAX=1.4
+PRICE_MIN=1.00
+PRICE_MAX=1.18
 PRICE_SELECTOR=
 ```
 
@@ -221,7 +221,7 @@ money at an 85% payout. Under that, the signals lose money in the long run.
 | `PRICE_SOURCE` | ws | `ws` = read live ticks from the page's websocket; `dom` = old text scraping |
 | `ASSET_ID` | none | EUR/USD id in the feed (see Step 6b) |
 | `PRICE_SELECTOR` | empty | Only for `PRICE_SOURCE=dom` |
-| `PRICE_MIN` / `PRICE_MAX` | 0.9 / 1.4 | Ignore any number outside this range (EUR/USD) |
+| `PRICE_MIN` / `PRICE_MAX` | 1.00 / 1.18 | Ignore any number outside this range (EUR/USD) |
 | `SIGNAL_GATE` | relaxed | `off`, `relaxed` (blocks only if provably below 50%), `strict` (signals only after proven edge) |
 | `EDGE_MODE` | adaptive | `adaptive` uses top-percent thresholds, `fixed` uses fixed ones |
 | `SIGNAL_TOP_PERCENT` | 3 | Lower = fewer, more selective signals |

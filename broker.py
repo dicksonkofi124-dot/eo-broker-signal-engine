@@ -301,7 +301,7 @@ def _archive_prediction_local(row: dict) -> None:
         logger.warning("Local prediction archive write failed: %s", exc)
 
 async def _select_favorite_eurusd(page) -> bool:
-    """Open Assets (Favorites/Search) and select active EUR/USD or EUR/USD OTC with highest payout."""
+    """Open Assets (Favorites/Search) and select active spot EUR/USD only (skipping OTC)."""
     if page is None or page.is_closed():
         return False
     try:
@@ -331,10 +331,9 @@ async def _select_favorite_eurusd(page) -> bool:
             except Exception:
                 pass
 
-        async def _pick_best_row() -> bool:
+        async def _pick_spot_row() -> bool:
             rows = page.locator("div, li, tr").filter(has_text=re.compile(r"EUR\s*/\s*USD", re.I))
             cnt = min(await rows.count(), 25)
-            best = None  # (payout, is_spot, locator, label)
             for idx in range(cnt):
                 row = rows.nth(idx)
                 if not await row.is_visible(timeout=150):
@@ -342,34 +341,29 @@ async def _select_favorite_eurusd(page) -> bool:
                 txt = " ".join((await row.inner_text()).split())
                 if len(txt) > 60 or not re.search(r"EUR\s*/\s*USD", txt, re.I):
                     continue
+                if "OTC" in txt.upper():
+                    continue
                 m_pay = re.search(r"(\d{2,3})\s*%", txt)
                 if not m_pay:
                     continue
-                payout = int(m_pay.group(1))
-                is_spot = "OTC" not in txt.upper()
-                label = "EUR/USD" if is_spot else "EUR/USD OTC"
-                score = (payout, 1 if is_spot else 0)
-                if best is None or score > (best[0], best[1]):
-                    best = (payout, 1 if is_spot else 0, row, f"{label} ({payout}%)")
-            if best is None:
-                return False
-            await best[2].click()
-            await asyncio.sleep(0.5)
-            btn = page.locator("button:has-text('Select Asset')").first
-            if await btn.count() > 0 and await btn.is_visible(timeout=400):
-                await btn.click()
-                await asyncio.sleep(1.0)
-            logger.info("Selected %s from Assets drawer automatically.", best[3])
-            return True
+                await row.click()
+                await asyncio.sleep(0.5)
+                btn = page.locator("button:has-text('Select Asset')").first
+                if await btn.count() > 0 and await btn.is_visible(timeout=400):
+                    await btn.click()
+                    await asyncio.sleep(1.0)
+                logger.info("Selected spot EUR/USD (%s%%) from Assets drawer automatically.", m_pay.group(1))
+                return True
+            return False
 
-        if await _pick_best_row():
+        if await _pick_spot_row():
             return True
 
         search_inp = page.locator("input[placeholder*='Search' i], input[type='search']").first
         if await search_inp.count() > 0 and await search_inp.is_visible(timeout=300):
             await search_inp.fill("EUR / USD")
             await asyncio.sleep(0.8)
-            return await _pick_best_row()
+            return await _pick_spot_row()
     except Exception as exc:
         logger.debug("Asset drawer selection attempt failed: %s", exc)
     return False
