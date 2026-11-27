@@ -300,6 +300,81 @@ def _archive_prediction_local(row: dict) -> None:
     except Exception as exc:
         logger.warning("Local prediction archive write failed: %s", exc)
 
+async def _select_favorite_eurusd(page) -> bool:
+    """Open Assets (Favorites/Search) and select active EUR/USD or EUR/USD OTC with highest payout."""
+    if page is None or page.is_closed():
+        return False
+    try:
+        select_btn = page.locator("button:has-text('Select Asset')").first
+        drawer_open = await select_btn.count() > 0 and await select_btn.is_visible(timeout=400)
+        if not drawer_open:
+            for opener in (
+                "button:has-text('EUR / USD')",
+                "button:has-text('GBP / USD')",
+                "button:has-text('USD / JPY')",
+                "button:has-text('OTC')",
+                "[class*='asset'][class*='select']",
+                "[class*='asset'][class*='current']",
+                "[class*='pair']",
+            ):
+                loc = page.locator(opener).first
+                if await loc.count() > 0 and await loc.is_visible(timeout=300):
+                    await loc.click()
+                    await asyncio.sleep(1.0)
+                    break
+
+        star_tab = page.locator("button:has(svg), [role='tab']").filter(has_text=re.compile(r"^\s*$")).first
+        if await star_tab.count() > 0 and await star_tab.is_visible(timeout=250):
+            try:
+                await star_tab.click()
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        async def _pick_best_row() -> bool:
+            rows = page.locator("div, li, tr").filter(has_text=re.compile(r"EUR\s*/\s*USD", re.I))
+            cnt = min(await rows.count(), 25)
+            best = None  # (payout, is_spot, locator, label)
+            for idx in range(cnt):
+                row = rows.nth(idx)
+                if not await row.is_visible(timeout=150):
+                    continue
+                txt = " ".join((await row.inner_text()).split())
+                if len(txt) > 60 or not re.search(r"EUR\s*/\s*USD", txt, re.I):
+                    continue
+                m_pay = re.search(r"(\d{2,3})\s*%", txt)
+                if not m_pay:
+                    continue
+                payout = int(m_pay.group(1))
+                is_spot = "OTC" not in txt.upper()
+                label = "EUR/USD" if is_spot else "EUR/USD OTC"
+                score = (payout, 1 if is_spot else 0)
+                if best is None or score > (best[0], best[1]):
+                    best = (payout, 1 if is_spot else 0, row, f"{label} ({payout}%)")
+            if best is None:
+                return False
+            await best[2].click()
+            await asyncio.sleep(0.5)
+            btn = page.locator("button:has-text('Select Asset')").first
+            if await btn.count() > 0 and await btn.is_visible(timeout=400):
+                await btn.click()
+                await asyncio.sleep(1.0)
+            logger.info("Selected %s from Assets drawer automatically.", best[3])
+            return True
+
+        if await _pick_best_row():
+            return True
+
+        search_inp = page.locator("input[placeholder*='Search' i], input[type='search']").first
+        if await search_inp.count() > 0 and await search_inp.is_visible(timeout=300):
+            await search_inp.fill("EUR / USD")
+            await asyncio.sleep(0.8)
+            return await _pick_best_row()
+    except Exception as exc:
+        logger.debug("Asset drawer selection attempt failed: %s", exc)
+    return False
+
+
 class PlaywrightScraperFeed:
     def __init__(self) -> None:
         self.playwright: Optional[Playwright] = None
@@ -557,11 +632,17 @@ class PlaywrightScraperFeed:
             if age <= PRICE_STALE_SECONDS:
                 continue
 
+            if not ASSET_ID:
+                self._auto_id = None
+                self._candidates.clear()
+
             frame_age = (now.timestamp() - self._last_frame_at) if self._last_frame_at else 1e9
             if PRICE_SOURCE == "ws" and frame_age < 15 and age <= 120:
                 logger.warning(
-                    "No EUR/USD ticks for %.0fs, but the site's data IS flowing. Is the EUR/USD chart open "
-                    "and the browser window visible (not minimised/hidden)? Waiting up to 120s before reloading.", age)
+                    "No EUR/USD ticks for %.0fs, but the site's data IS flowing. Checking Favorites for EUR/USD or EUR/USD OTC...", age)
+                if now.timestamp() - getattr(self, "_last_asset_pick_at", 0.0) >= 35:
+                    self._last_asset_pick_at = now.timestamp()
+                    await _select_favorite_eurusd(self.page)
                 continue
             logger.warning("Price stale for %.0fs (last site data %.0fs ago).", age, min(frame_age, 9999))
             try:
@@ -576,8 +657,10 @@ class PlaywrightScraperFeed:
                     await self._launch_browser()
                 else:
                     self._reload_count += 1
-                    logger.warning("Reloading page (attempt %s)", self._reload_count)
+                    logger.warning("Reloading page and selecting EUR/USD favorite (attempt %s)", self._reload_count)
                     await self.page.reload(timeout=60_000)
+                    await asyncio.sleep(3)
+                    await _select_favorite_eurusd(self.page)
             except Exception as exc:
                 logger.error("Browser recovery failed: %s", exc)
                 await asyncio.sleep(10)
